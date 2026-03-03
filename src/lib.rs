@@ -1,13 +1,17 @@
 pub mod keyboard;
 pub mod note;
+pub mod renderer;
 
 use std::iter;
+use wgpu::util::DeviceExt;
 use winit::{
     event::*,
     event_loop::EventLoop,
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
+
+use renderer::quad::QuadInstance;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
@@ -19,6 +23,8 @@ struct State<'a> {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     window: &'a Window,
+    quad_renderer: renderer::quad::QuadRenderer,
+    test_buffer: wgpu::Buffer,
 }
 
 impl<'a> State<'a> {
@@ -73,7 +79,20 @@ impl<'a> State<'a> {
             view_formats: vec![],
         };
 
-        Self { surface, device, queue, config, size, window }
+        let quad_renderer = renderer::quad::QuadRenderer::new(&device, surface_format);
+
+        let test_instances = [QuadInstance {
+            pos: [100.0, 100.0],
+            size: [200.0, 50.0],
+            color: [0.0, 0.5, 1.0, 1.0],
+        }];
+        let test_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Test"),
+            contents: bytemuck::cast_slice(&test_instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self { surface, device, queue, config, size, window, quad_renderer, test_buffer }
     }
 
     fn window(&self) -> &Window { &self.window }
@@ -93,11 +112,18 @@ impl<'a> State<'a> {
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.quad_renderer.update_globals(
+            &self.queue,
+            self.size.width as f32,
+            self.size.height as f32,
+        );
+
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") },
         );
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -111,6 +137,7 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            self.quad_renderer.draw(&mut render_pass, &self.test_buffer, 1);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
