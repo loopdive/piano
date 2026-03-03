@@ -227,6 +227,20 @@ impl State {
         }
     }
 
+    /// Check if the viewport has changed (iOS PWA orientation changes may not fire Resized events).
+    #[cfg(target_arch = "wasm32")]
+    fn check_viewport_resize(&mut self) {
+        let win = web_sys::window().unwrap();
+        let dpr = win.device_pixel_ratio();
+        let css_w = win.inner_width().unwrap().as_f64().unwrap();
+        let css_h = win.inner_height().unwrap().as_f64().unwrap();
+        let pw = (css_w * dpr) as u32;
+        let ph = (css_h * dpr) as u32;
+        if pw != self.size.width || ph != self.size.height {
+            self.resize(winit::dpi::PhysicalSize::new(pw, ph));
+        }
+    }
+
     #[allow(unused_variables)]
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         // On WASM, recalculate canvas buffer size from CSS viewport * DPR
@@ -1138,6 +1152,9 @@ impl ApplicationHandler<State> for App {
             }
             WindowEvent::RedrawRequested => {
                 if !state.surface_configured { return; }
+                // iOS PWA: detect orientation changes that bypass Resized events
+                #[cfg(target_arch = "wasm32")]
+                state.check_viewport_resize();
                 state.update();
                 match state.render() {
                     Ok(_) => {}

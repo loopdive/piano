@@ -2,6 +2,8 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Piano Fall</title>
     <style>
       body {
@@ -11,8 +13,12 @@
       }
       #piano-fall {
         width: 100vw;
-        height: 100vh;
+        height: 100dvh; /* dynamic viewport height for iOS Safari */
+        height: 100vh; /* fallback for browsers without dvh */
         position: relative;
+      }
+      @supports (height: 100dvh) {
+        #piano-fall { height: 100dvh; }
       }
       #piano-fall canvas {
         width: 100%;
@@ -207,23 +213,35 @@
           }
         };
 
-        window._pianoResume = function () {
+        // iOS Safari requires AudioContext creation + resume inside a user gesture.
+        // Play a silent buffer to fully unlock audio on iOS.
+        function unlockAudio() {
           if (!ctx) {
-            ctx = new AudioContext();
+            const AC = window.AudioContext || window.webkitAudioContext;
+            ctx = new AC();
             preload();
           }
-          if (ctx.state !== "running") ctx.resume();
-        };
+          if (ctx.state === "suspended") {
+            ctx.resume();
+            // iOS needs a silent buffer play to fully unlock
+            const silent = ctx.createBuffer(1, 1, 22050);
+            const src = ctx.createBufferSource();
+            src.buffer = silent;
+            src.connect(ctx.destination);
+            src.start();
+          }
+        }
 
-        // Start loading on first user interaction
-        document.addEventListener(
-          "click",
-          function init() {
-            window._pianoResume();
-            document.removeEventListener("click", init);
-          },
-          { once: true },
-        );
+        window._pianoResume = unlockAudio;
+
+        // Start loading on first user interaction (click + touchstart for iOS)
+        function init() {
+          unlockAudio();
+          document.removeEventListener("click", init);
+          document.removeEventListener("touchstart", init);
+        }
+        document.addEventListener("click", init, { once: false });
+        document.addEventListener("touchstart", init, { once: false });
       })();
     </script>
 
