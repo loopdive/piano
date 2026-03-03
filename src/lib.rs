@@ -18,12 +18,73 @@ use winit::{
 };
 
 use renderer::keys::KeyInstance3D;
-use renderer::quad::QuadInstance;
+use renderer::quad::{QuadInstance, LabelInstance};
 
 #[derive(Clone, Copy, PartialEq)]
 enum DragAxis {
     Horizontal,
     Vertical,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum NoteTheme {
+    Rainbow,
+    Ice,
+}
+
+fn default_theme() -> NoteTheme {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(win) = web_sys::window() {
+            if let Ok(search) = win.location().search() {
+                if search.contains("theme=ice") {
+                    return NoteTheme::Ice;
+                }
+            }
+        }
+    }
+    NoteTheme::Rainbow
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h6 = h * 6.0;
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = if h6 < 1.0 {
+        (c, x, 0.0)
+    } else if h6 < 2.0 {
+        (x, c, 0.0)
+    } else if h6 < 3.0 {
+        (0.0, c, x)
+    } else if h6 < 4.0 {
+        (0.0, x, c)
+    } else if h6 < 5.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    let m = l - c * 0.5;
+    (r1 + m, g1 + m, b1 + m)
+}
+
+fn note_color(pitch: u8, velocity: f32, theme: NoteTheme) -> [f32; 4] {
+    match theme {
+        NoteTheme::Rainbow => {
+            let note = (pitch + 9) % 12;
+            let hue = note as f32 / 12.0;
+            let dim = 0.4 + velocity * 0.6;
+            let (r, g, b) = hsl_to_rgb(hue, 0.7, 0.40 * dim);
+            [r, g, b, 1.0]
+        }
+        NoteTheme::Ice => {
+            let pr = pitch as f32 / 87.0;
+            let dim = 0.35 + velocity * 0.65;
+            let r = (0.08 + pr * 0.25) * dim;
+            let g = (0.45 + pr * 0.35) * dim;
+            let b = (0.95 + pr * 0.05) * dim;
+            [r, g, b, 1.0]
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -90,6 +151,8 @@ struct State {
     song: note::Song,
     note_instance_buffer: wgpu::Buffer,
     note_instance_count: u32,
+    label_instance_buffer: wgpu::Buffer,
+    label_instance_count: u32,
     #[cfg(target_arch = "wasm32")]
     audio_player: Option<audio::AudioPlayer>,
     triggered_notes: Vec<bool>,
@@ -113,6 +176,15 @@ struct State {
     drag_axis: Option<DragAxis>,
     scroll_velocity: f64,
     was_paused_before_drag: bool,
+    theme: NoteTheme,
+    // Zoom
+    keyboard_zoom: f32,
+    // Multi-touch pinch tracking
+    touches: std::collections::HashMap<u64, (f64, f64)>,
+    pinch_base_dist: f64,
+    pinch_base_zoom: f32,
+    // Modifier key state (for Ctrl+scroll zoom)
+    modifiers: winit::event::Modifiers,
 }
 
 impl State {
@@ -174,12 +246,14 @@ impl State {
         // QuadRenderer for offscreen (notes/particles → bloom source)
         let quad_renderer = renderer::quad::QuadRenderer::new(
             &device,
+            &queue,
             renderer::bloom::BloomRenderer::offscreen_format(),
         );
 
         // QuadRenderer for screen (keyboard BG → swapchain, drawn after composite)
         let screen_quad_renderer = renderer::quad::QuadRenderer::new(
             &device,
+            &queue,
             surface_format,
         );
 
@@ -235,6 +309,13 @@ impl State {
             mapped_at_creation: false,
         });
 
+        let label_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Label Instances"),
+            size: (2000 * std::mem::size_of::<LabelInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             surface, device, queue, config, size, window,
             quad_renderer, screen_quad_renderer, bloom, particle_system,
@@ -243,7 +324,7 @@ impl State {
             overlay_instance_buffer, overlay_instance_count: 0,
             key_instances_3d: Vec::new(),
             start_time, current_time: 0.0, last_wall_time: 0.0, song, note_instance_buffer,
-            note_instance_count: 0,
+            note_instance_count: 0, label_instance_buffer, label_instance_count: 0,
             #[cfg(target_arch = "wasm32")]
             audio_player,
             triggered_notes,
@@ -265,6 +346,12 @@ impl State {
             drag_axis: None,
             scroll_velocity: 0.0,
             was_paused_before_drag: false,
+            theme: default_theme(),
+            keyboard_zoom: 1.0,
+            touches: std::collections::HashMap::new(),
+            pinch_base_dist: 0.0,
+            pinch_base_zoom: 1.0,
+            modifiers: winit::event::Modifiers::default(),
         }
     }
 
@@ -299,7 +386,8 @@ impl State {
 
     fn clamp_h_offset(&self, offset: f32) -> f32 {
         let screen_w = self.size.width as f32;
-        offset.clamp(-screen_w * 0.8, screen_w * 0.8)
+        let max_offset = screen_w * (self.keyboard_zoom - 1.0) * 0.5 + screen_w * 0.3;
+        offset.clamp(-max_offset, max_offset)
     }
 
     #[allow(unused_variables)]
@@ -383,7 +471,7 @@ impl State {
                     }
                 }
             }
-            // Touch drag
+            // Touch: single-finger drag + multi-finger pinch-to-zoom
             WindowEvent::Touch(touch) => {
                 match touch.phase {
                     winit::event::TouchPhase::Started => {
@@ -395,38 +483,112 @@ impl State {
                             }
                             self.waiting_for_samples = true;
                         }
-                        self.cursor_x = touch.location.x;
-                        self.cursor_y = touch.location.y;
-                        self.drag_active = true;
-                        self.drag_start_x = self.cursor_x;
-                        self.drag_start_y = self.cursor_y;
-                        self.drag_prev_x = self.cursor_x;
-                        self.drag_prev_y = self.cursor_y;
-                        self.drag_axis = None;
-                        self.scroll_velocity = 0.0;
-                        self.h_velocity = 0.0;
-                        self.was_paused_before_drag = self.paused;
-                        self.rewind_target = None;
+                        self.touches.insert(touch.id, (touch.location.x, touch.location.y));
+                        if self.touches.len() >= 2 {
+                            // Start pinch: record baseline distance and zoom
+                            let pts: Vec<(f64, f64)> = self.touches.values().copied().collect();
+                            let dx = pts[0].0 - pts[1].0;
+                            let dy = pts[0].1 - pts[1].1;
+                            self.pinch_base_dist = (dx * dx + dy * dy).sqrt().max(1.0);
+                            self.pinch_base_zoom = self.keyboard_zoom;
+                            self.drag_active = false; // suppress single-finger drag during pinch
+                        } else {
+                            // Single touch — start drag
+                            self.cursor_x = touch.location.x;
+                            self.cursor_y = touch.location.y;
+                            self.drag_active = true;
+                            self.drag_start_x = self.cursor_x;
+                            self.drag_start_y = self.cursor_y;
+                            self.drag_prev_x = self.cursor_x;
+                            self.drag_prev_y = self.cursor_y;
+                            self.drag_axis = None;
+                            self.scroll_velocity = 0.0;
+                            self.h_velocity = 0.0;
+                            self.was_paused_before_drag = self.paused;
+                            self.rewind_target = None;
+                        }
                         return true;
                     }
                     winit::event::TouchPhase::Moved => {
-                        self.cursor_x = touch.location.x;
-                        self.cursor_y = touch.location.y;
+                        self.touches.insert(touch.id, (touch.location.x, touch.location.y));
+                        if self.touches.len() >= 2 {
+                            // Pinch zoom
+                            let pts: Vec<(f64, f64)> = self.touches.values().copied().collect();
+                            let dx = pts[0].0 - pts[1].0;
+                            let dy = pts[0].1 - pts[1].1;
+                            let new_dist = (dx * dx + dy * dy).sqrt().max(1.0);
+                            let old_zoom = self.keyboard_zoom;
+                            self.keyboard_zoom = (self.pinch_base_zoom * (new_dist / self.pinch_base_dist) as f32)
+                                .clamp(1.0, 5.0);
+                            // Keep pinch midpoint visually stable
+                            let mid_x = ((pts[0].0 + pts[1].0) / 2.0) as f32;
+                            if old_zoom > 0.0 {
+                                self.h_offset = mid_x - (mid_x - self.h_offset) * (self.keyboard_zoom / old_zoom);
+                                self.h_offset = self.clamp_h_offset(self.h_offset);
+                            }
+                        } else {
+                            // Single-touch move (drag)
+                            self.cursor_x = touch.location.x;
+                            self.cursor_y = touch.location.y;
+                        }
                         return true;
                     }
                     winit::event::TouchPhase::Ended
                     | winit::event::TouchPhase::Cancelled => {
-                        self.drag_active = false;
+                        self.touches.remove(&touch.id);
+                        if self.touches.len() < 2 {
+                            // End pinch; if one finger remains, restart drag from it
+                            if let Some((&_id, &(x, y))) = self.touches.iter().next() {
+                                self.cursor_x = x;
+                                self.cursor_y = y;
+                                self.drag_active = true;
+                                self.drag_start_x = x;
+                                self.drag_start_y = y;
+                                self.drag_prev_x = x;
+                                self.drag_prev_y = y;
+                                self.drag_axis = None;
+                                self.scroll_velocity = 0.0;
+                                self.h_velocity = 0.0;
+                            }
+                        }
+                        if self.touches.is_empty() {
+                            self.drag_active = false;
+                        }
                         return true;
                     }
                 }
             }
-            // Mouse wheel: scroll up = rewind, scroll down = fast-forward
+            // Track modifier keys for Ctrl+scroll zoom
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = *new_modifiers;
+                return false;
+            }
+            // macOS trackpad pinch gesture
+            WindowEvent::PinchGesture { delta, .. } => {
+                let old_zoom = self.keyboard_zoom;
+                self.keyboard_zoom = (self.keyboard_zoom * (1.0 + *delta as f32)).clamp(1.0, 5.0);
+                // Keep screen center visually stable
+                let center_x = self.size.width as f32 / 2.0;
+                self.h_offset = center_x - (center_x - self.h_offset) * (self.keyboard_zoom / old_zoom);
+                self.h_offset = self.clamp_h_offset(self.h_offset);
+                return true;
+            }
+            // Mouse wheel: Ctrl held = zoom, otherwise scroll time
             WindowEvent::MouseWheel { delta, .. } => {
                 let pixels = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => *y as f64 * 60.0,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y,
                 };
+                if self.modifiers.state().control_key() {
+                    // Ctrl+scroll: zoom in/out centered on cursor
+                    let zoom_delta = pixels as f32 / 500.0;
+                    let old_zoom = self.keyboard_zoom;
+                    self.keyboard_zoom = (self.keyboard_zoom * (1.0 + zoom_delta)).clamp(1.0, 5.0);
+                    let anchor_x = self.cursor_x as f32;
+                    self.h_offset = anchor_x - (anchor_x - self.h_offset) * (self.keyboard_zoom / old_zoom);
+                    self.h_offset = self.clamp_h_offset(self.h_offset);
+                    return true;
+                }
                 // Positive pixels = scroll up = rewind (go back in time)
                 self.current_time -= pixels / 400.0;
                 self.current_time = self.current_time.max(0.0);
@@ -467,6 +629,13 @@ impl State {
                         self.paused = false;
                         return true;
                     }
+                    KeyCode::KeyT => {
+                        self.theme = match self.theme {
+                            NoteTheme::Rainbow => NoteTheme::Ice,
+                            NoteTheme::Ice => NoteTheme::Rainbow,
+                        };
+                        return true;
+                    }
                     _ => {}
                 }
             }
@@ -483,7 +652,7 @@ impl State {
                     log::info!("Loaded MIDI: {} notes, {:.0} BPM, title={}", song.notes.len(), song.bpm, song.title);
                     #[cfg(target_arch = "wasm32")]
                     set_song_title(&song.title);
-                    self.h_offset = Self::auto_center_offset(&song, self.size.width as f32);
+                    self.h_offset = Self::auto_center_offset(&song, self.size.width as f32 * self.keyboard_zoom);
                     self.h_velocity = 0.0;
                     self.triggered_notes = vec![false; song.notes.len()];
                     self.song = song;
@@ -558,13 +727,16 @@ impl State {
                     }
                 }
                 Some(DragAxis::Horizontal) => {
-                    // Horizontal drag: scroll keyboard
+                    // Horizontal drag: scroll keyboard — playback continues
                     let delta_x = self.cursor_x - self.drag_prev_x;
                     self.h_offset += delta_x as f32;
                     self.h_offset = self.clamp_h_offset(self.h_offset);
                     if wall_dt > 0.0 {
                         let instant_vel = delta_x / wall_dt;
                         self.h_velocity = self.h_velocity * 0.7 + instant_vel * 0.3;
+                    }
+                    if !self.paused {
+                        self.current_time += wall_dt;
                     }
                 }
             }
@@ -588,14 +760,16 @@ impl State {
                 self.paused = self.was_paused_before_drag;
             }
         } else if self.h_velocity.abs() > 1.0 {
-            // Horizontal momentum scrolling after drag release
+            // Horizontal momentum scrolling after drag release — playback continues
             let friction = 8.0;
             self.h_velocity *= (-friction * wall_dt).exp();
             self.h_offset += (self.h_velocity * wall_dt) as f32;
             self.h_offset = self.clamp_h_offset(self.h_offset);
+            if !self.paused {
+                self.current_time += wall_dt;
+            }
             if self.h_velocity.abs() <= 1.0 {
                 self.h_velocity = 0.0;
-                self.paused = self.was_paused_before_drag;
             }
         } else if let Some(target) = self.rewind_target {
             let rewind_speed = 8.0;
@@ -621,40 +795,49 @@ impl State {
 
         let screen_w = self.size.width as f32;
         let screen_h = self.size.height as f32;
+        let zoomed_width = screen_w * self.keyboard_zoom;
         let bottom_margin = screen_h * 0.03;
         // Derive keyboard height from white key width to maintain aspect ratio
-        let white_key_width = screen_w / 49.0;
+        let white_key_width = zoomed_width / 49.0;
         let keyboard_height = white_key_width * 6.0;
         let keyboard_y = screen_h - keyboard_height - bottom_margin;
-        let scroll_speed_f = scroll_speed as f32;
+        let scroll_speed_f = scroll_speed as f32 * self.keyboard_zoom;
         let t = self.current_time as f32;
         let ho = self.h_offset; // horizontal offset for all key positions
 
         let mut note_instances = Vec::new();
+        let mut label_instances: Vec<LabelInstance> = Vec::new();
         let note_clip_y_grid = keyboard_y - keyboard_height * 0.16;
         // Grid: vertical line at center of every key lane
         // White keys: C is brightest white, descending through the octave toward note-blue
         // Black keys: half brightness, stay white
         for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
-            let (x, w) = keyboard::key_rect(pitch, screen_w);
+            let (x, w) = keyboard::key_rect(pitch, zoomed_width);
             let x = x + ho;
             let semitone = (pitch + 9) % 12; // C=0, C#=1, ..., B=11
             let is_black = keyboard::is_black_key(pitch);
             let color = if is_black {
                 [1.0, 1.0, 1.0, 0.12]
             } else {
-                // Map white keys within octave: C=0, D=1, E=2, F=3, G=4, A=5, B=6
-                let white_pos = match semitone {
-                    0 => 0, 2 => 1, 4 => 2, 5 => 3, 7 => 4, 9 => 5, 11 => 6, _ => 0,
-                };
-                let frac = white_pos as f32 / 6.0; // 0.0 (C) to 1.0 (B)
-                // Blend from white toward note-blue [0.3, 0.7, 1.0]
-                let r = 1.0 * (1.0 - frac) + 0.3 * frac;
-                let g = 1.0 * (1.0 - frac) + 0.7 * frac;
-                let b = 1.0;
-                // Alpha: C brightest (0.44), B dimmest (0.18)
-                let alpha = 0.44 * (1.0 - frac) + 0.18 * frac;
-                [r, g, b, alpha]
+                match self.theme {
+                    NoteTheme::Ice => {
+                        // Map white keys within octave: C=0, D=1, E=2, F=3, G=4, A=5, B=6
+                        let white_pos = match semitone {
+                            0 => 0, 2 => 1, 4 => 2, 5 => 3, 7 => 4, 9 => 5, 11 => 6, _ => 0,
+                        };
+                        let frac = white_pos as f32 / 6.0;
+                        let r = 1.0 * (1.0 - frac) + 0.3 * frac;
+                        let g = 1.0 * (1.0 - frac) + 0.7 * frac;
+                        let b = 1.0;
+                        let alpha = 0.44 * (1.0 - frac) + 0.18 * frac;
+                        [r, g, b, alpha]
+                    }
+                    NoteTheme::Rainbow => {
+                        let hue = semitone as f32 / 12.0;
+                        let (r, g, b) = hsl_to_rgb(hue, 0.25, 0.55);
+                        [r, g, b, 0.15]
+                    }
+                }
             };
             note_instances.push(QuadInstance {
                 pos: [x + w * 0.5, 0.0],
@@ -703,7 +886,7 @@ impl State {
                 continue;
             }
 
-            let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
+            let (key_x, key_w) = keyboard::key_rect(n.pitch, zoomed_width);
             let key_x = key_x + ho;
 
             // Add vertical gap between consecutive notes
@@ -719,36 +902,47 @@ impl State {
                 continue;
             }
 
-            // Single quad per note — velocity controls brightness
-            let pr = n.pitch as f32 / 87.0;
-            let vel = n.velocity;
-            let dim = 0.35 + vel * 0.65;
-            let r = (0.08 + pr * 0.25) * dim;
-            let g = (0.45 + pr * 0.35) * dim;
-            let b = (0.95 + pr * 0.05) * dim;
+            let color = note_color(n.pitch, n.velocity, self.theme);
 
             let inset = 2.0;
             note_instances.push(QuadInstance {
                 pos: [key_x + inset, visible_top],
                 size: [key_w - inset * 2.0, visible_bottom - visible_top],
-                color: [r, g, b, 1.0],
+                color,
             });
+
+            // Label at onset (bottom) of note strip
+            let label_size = (key_w - 4.0).min(42.0).max(6.0);
+            let label_y = visible_bottom - label_size;
+            if label_y >= visible_top {
+                let pc = keyboard::pitch_class(n.pitch);
+                label_instances.push(LabelInstance {
+                    pos: [key_x + (key_w - label_size) * 0.5, label_y],
+                    size: [label_size, label_size],
+                    color: [0.0, 0.0, 0.0, 0.85],
+                    glyph_uv: [pc as f32 / 12.0, 0.0],
+                    glyph_size: [1.0 / 12.0, 1.0],
+                });
+            }
         }
 
         // Upward-fading hazy glow at the front panel top (where notes disappear)
-        let glow_base = keyboard_y - keyboard_height * 0.16; // top of front panel
-        let glow_layers: &[(f32, f32, [f32; 4])] = &[
-            (0.0,  2.0,  [0.20, 0.50, 1.0, 0.9]),  // bright core line
-            (2.0,  8.0,  [0.12, 0.35, 0.85, 0.4]),  // near glow
-            (10.0, 18.0, [0.08, 0.25, 0.65, 0.15]), // mid haze
-            (28.0, 30.0, [0.04, 0.15, 0.45, 0.06]), // outer fade
-        ];
-        for &(offset, h, color) in glow_layers {
-            note_instances.push(QuadInstance {
-                pos: [0.0, glow_base - offset - h],
-                size: [screen_w, h],
-                color,
-            });
+        // Only shown in Ice theme — Rainbow uses a clean edge
+        if self.theme == NoteTheme::Ice {
+            let glow_base = keyboard_y - keyboard_height * 0.16;
+            let glow_layers: &[(f32, f32, [f32; 4])] = &[
+                (0.0,  2.0,  [0.20, 0.50, 1.0, 0.9]),  // bright core line
+                (2.0,  8.0,  [0.12, 0.35, 0.85, 0.4]),  // near glow
+                (10.0, 18.0, [0.08, 0.25, 0.65, 0.15]), // mid haze
+                (28.0, 30.0, [0.04, 0.15, 0.45, 0.06]), // outer fade
+            ];
+            for &(offset, h, color) in glow_layers {
+                note_instances.push(QuadInstance {
+                    pos: [0.0, glow_base - offset - h],
+                    size: [screen_w, h],
+                    color,
+                });
+            }
         }
 
         if !note_instances.is_empty() {
@@ -759,6 +953,15 @@ impl State {
             );
         }
         self.note_instance_count = note_instances.len() as u32;
+
+        if !label_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.label_instance_buffer,
+                0,
+                bytemuck::cast_slice(&label_instances),
+            );
+        }
+        self.label_instance_count = label_instances.len() as u32;
 
         // Determine active keys
         let mut active_keys = [false; 88];
@@ -803,12 +1006,22 @@ impl State {
         for n in &self.song.notes {
             if !keyboard::is_visible(n.pitch) { continue; }
             if t >= n.start_time && t < n.start_time + n.duration {
-                let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
+                let (key_x, key_w) = keyboard::key_rect(n.pitch, zoomed_width);
                 let spawn_x = key_x + ho + key_w / 2.0;
                 let spawn_y = keyboard_y;
 
-                let pr = n.pitch as f32 / 87.0;
-                let color = [0.3 + pr * 0.4, 0.6 + pr * 0.3, 1.0];
+                let color = match self.theme {
+                    NoteTheme::Rainbow => {
+                        let note = (n.pitch + 9) % 12;
+                        let hue = note as f32 / 12.0;
+                        let (r, g, b) = hsl_to_rgb(hue, 0.75, 0.50);
+                        [r, g, b]
+                    }
+                    NoteTheme::Ice => {
+                        let pr = n.pitch as f32 / 87.0;
+                        [0.3 + pr * 0.4, 0.6 + pr * 0.3, 1.0]
+                    }
+                };
 
                 // Spawn 2-3 particles per frame per active note
                 self.particle_system.spawn(spawn_x, spawn_y, color, 3);
@@ -851,7 +1064,7 @@ impl State {
             let bk_depth_px = keyboard_height * 0.60;
 
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
-                let (x, w) = keyboard::key_rect(pitch, screen_w);
+                let (x, w) = keyboard::key_rect(pitch, zoomed_width);
                 let x = x + ho;
                 let is_black = keyboard::is_black_key(pitch);
                 let press = self.key_press_state[pitch as usize];
@@ -912,31 +1125,34 @@ impl State {
                 size: [screen_w, front_panel_h],
                 color: [0.06, 0.06, 0.07, 1.0],
             });
-            // Neon glow at the top edge of the front panel
-            // Gradient layers above the core line, fading upward
+            // Neon glow at the top edge of the front panel (Ice theme only)
             let glow_top = keyboard_y - front_panel_h;
-            // Smooth glow: many thin layers to avoid visible banding
-            let glow_total_h = 144.0_f32;
-            let glow_steps = 24_u32;
-            let step_h = glow_total_h / glow_steps as f32;
-            for s in 0..glow_steps {
-                let frac = s as f32 / (glow_steps - 1) as f32; // 0 = top (far), 1 = bottom (near core)
-                let alpha = 0.02 + frac * frac * 0.35; // quadratic falloff
-                // Saturated blue at top → white at bottom (near core line)
-                let r = 0.15 + frac * 0.8;
-                let g = 0.4 + frac * 0.55;
-                let y = glow_top - glow_total_h + s as f32 * step_h;
-                kb_instances.push(QuadInstance {
-                    pos: [0.0, y],
-                    size: [screen_w, step_h + 1.0], // +1 overlap to prevent gaps
-                    color: [r.min(1.0), g.min(1.0), 1.0, alpha],
-                });
+            if self.theme == NoteTheme::Ice {
+                let glow_total_h = 144.0_f32;
+                let glow_steps = 24_u32;
+                let step_h = glow_total_h / glow_steps as f32;
+                for s in 0..glow_steps {
+                    let frac = s as f32 / (glow_steps - 1) as f32;
+                    let alpha = 0.02 + frac * frac * 0.35;
+                    let r = 0.15 + frac * 0.8;
+                    let g = 0.4 + frac * 0.55;
+                    let y = glow_top - glow_total_h + s as f32 * step_h;
+                    kb_instances.push(QuadInstance {
+                        pos: [0.0, y],
+                        size: [screen_w, step_h + 1.0],
+                        color: [r.min(1.0), g.min(1.0), 1.0, alpha],
+                    });
+                }
             }
-            // Bright near-white core line
+            // Core line at top edge of front panel
             kb_instances.push(QuadInstance {
                 pos: [0.0, glow_top],
                 size: [screen_w, 2.0],
-                color: [0.95, 0.97, 1.0, 1.0],
+                color: if self.theme == NoteTheme::Ice {
+                    [0.95, 0.97, 1.0, 1.0]
+                } else {
+                    [0.15, 0.15, 0.17, 1.0]
+                },
             });
             self.queue.write_buffer(
                 &self.keyboard_instance_buffer,
@@ -959,7 +1175,7 @@ impl State {
 
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 if !keyboard::is_black_key(pitch) {
-                    let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let (x, w) = keyboard::key_rect(pitch, zoomed_width);
                     let x = x + ho;
                     let active = active_keys[pitch as usize];
                     let kx = x + gap * 0.5;
@@ -1012,7 +1228,7 @@ impl State {
 
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 if keyboard::is_black_key(pitch) {
-                    let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let (x, w) = keyboard::key_rect(pitch, zoomed_width);
                     let x = x + ho;
                     let active = active_keys[pitch as usize];
                     let bk_spot = bk_height * 0.18;
@@ -1100,6 +1316,7 @@ impl State {
         if !self.paused { return true; }
         if self.waiting_for_samples { return true; }
         if self.drag_active { return true; }
+        if self.touches.len() >= 2 { return true; }
         if self.scroll_velocity.abs() > 0.5 { return true; }
         if self.h_velocity.abs() > 0.5 { return true; }
         if self.rewind_target.is_some() { return true; }
@@ -1156,6 +1373,13 @@ impl State {
                     self.note_instance_count,
                 );
             }
+            if self.label_instance_count > 0 {
+                self.quad_renderer.draw_labels(
+                    &mut pass,
+                    &self.label_instance_buffer,
+                    self.label_instance_count,
+                );
+            }
             self.particle_system.draw(
                 &mut pass,
                 self.quad_renderer.globals_bind_group_notes(),
@@ -1201,7 +1425,7 @@ impl State {
         if self.use_3d_keys && !self.key_instances_3d.is_empty() {
             let screen_h = self.size.height as f32;
             let bottom_margin = screen_h * 0.03;
-            let white_key_width = self.size.width as f32 / 49.0;
+            let white_key_width = self.size.width as f32 * self.keyboard_zoom / 49.0;
             let keyboard_height = white_key_width * 6.0;
             let keyboard_y = screen_h - keyboard_height - bottom_margin;
             let max_depth = keyboard_height * 0.95;

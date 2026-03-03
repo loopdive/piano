@@ -71,3 +71,47 @@ fn fs_quad(in: VertexOutput) -> @location(0) vec4<f32> {
     let col = in.color.rgb * gradient * border_boost;
     return vec4<f32>(col, in.color.a * edge_alpha);
 }
+
+// -- Note letter labels --
+
+@group(1) @binding(0) var font_atlas: texture_2d<f32>;
+@group(1) @binding(1) var font_sampler: sampler;
+
+struct LabelInput {
+    @location(0) pos: vec2<f32>,
+    @location(1) size: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) glyph_uv: vec2<f32>,
+    @location(4) glyph_size: vec2<f32>,
+};
+
+struct LabelVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) atlas_uv: vec2<f32>,
+};
+
+@vertex
+fn vs_label(
+    @builtin(vertex_index) vertex_index: u32,
+    instance: LabelInput,
+) -> LabelVertexOutput {
+    let x = f32(vertex_index & 1u);
+    let y = f32((vertex_index >> 1u) & 1u);
+    let pixel_pos = instance.pos + vec2<f32>(x, y) * instance.size;
+    let ndc = vec2<f32>(
+        pixel_pos.x / globals.screen_size.x * 2.0 - 1.0,
+        1.0 - pixel_pos.y / globals.screen_size.y * 2.0,
+    );
+    var out: LabelVertexOutput;
+    out.position = vec4<f32>(ndc, 0.0, 1.0);
+    out.color = instance.color;
+    out.atlas_uv = instance.glyph_uv + vec2<f32>(x, y) * instance.glyph_size;
+    return out;
+}
+
+@fragment
+fn fs_label(in: LabelVertexOutput) -> @location(0) vec4<f32> {
+    let alpha = textureSample(font_atlas, font_sampler, in.atlas_uv).r;
+    return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}

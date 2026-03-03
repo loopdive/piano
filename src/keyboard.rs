@@ -7,6 +7,11 @@ pub const VISIBLE_START: u8 = 3;
 /// Last visible pitch (B7)
 pub const VISIBLE_END: u8 = 86;
 
+/// Returns the pitch class (0=C, 1=C#, ..., 11=B) for a given pitch.
+pub fn pitch_class(pitch: u8) -> u8 {
+    (pitch + 9) % 12
+}
+
 /// Returns true if the given pitch (0-87) is a black key.
 pub fn is_black_key(pitch: u8) -> bool {
     // Pitch 0 = A0. Shift so C=0: C=0, C#=1, D=2, D#=3, E=4, F=5, F#=6, G=7, G#=8, A=9, A#=10, B=11
