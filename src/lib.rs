@@ -3,7 +3,6 @@ pub mod note;
 pub mod renderer;
 
 use std::iter;
-use wgpu::util::DeviceExt;
 use winit::{
     event::*,
     event_loop::EventLoop,
@@ -26,6 +25,7 @@ struct State<'a> {
     quad_renderer: renderer::quad::QuadRenderer,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
+    #[allow(dead_code)] // used only on wasm32
     start_time: f64,
     current_time: f64,
     song: note::Song,
@@ -87,48 +87,13 @@ impl<'a> State<'a> {
 
         let quad_renderer = renderer::quad::QuadRenderer::new(&device, surface_format);
 
-        let keyboard_height = size.height as f32 * 0.2;
-        let keyboard_y = size.height as f32 - keyboard_height;
-        let keyboard_width = size.width as f32;
-
-        let mut keyboard_instances = Vec::new();
-
-        // White keys first (drawn underneath)
-        for pitch in 0..88u8 {
-            if !keyboard::is_black_key(pitch) {
-                let (x, w) = keyboard::key_rect(pitch, keyboard_width);
-                keyboard_instances.push(QuadInstance {
-                    pos: [x, keyboard_y],
-                    size: [w - 1.0, keyboard_height],
-                    color: [0.9, 0.9, 0.9, 1.0],
-                });
-            }
-        }
-
-        // Black keys on top
-        for pitch in 0..88u8 {
-            if keyboard::is_black_key(pitch) {
-                let (x, w) = keyboard::key_rect(pitch, keyboard_width);
-                keyboard_instances.push(QuadInstance {
-                    pos: [x, keyboard_y],
-                    size: [w, keyboard_height * 0.65],
-                    color: [0.15, 0.15, 0.15, 1.0],
-                });
-            }
-        }
-
-        let keyboard_instance_count = keyboard_instances.len() as u32;
         let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Keyboard Instances"),
             size: (88 * std::mem::size_of::<QuadInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(
-            &keyboard_instance_buffer,
-            0,
-            bytemuck::cast_slice(&keyboard_instances),
-        );
+        let keyboard_instance_count = 0;
 
         let start_time = 0.0;
         let song = note::demo_song();
@@ -222,6 +187,58 @@ impl<'a> State<'a> {
             );
         }
         self.note_instance_count = note_instances.len() as u32;
+
+        // Determine active keys
+        let mut active_keys = [false; 88];
+        for n in &self.song.notes {
+            if t >= n.start_time && t < n.start_time + n.duration {
+                active_keys[n.pitch as usize] = true;
+            }
+        }
+
+        // Rebuild keyboard instances with highlighting
+        let mut kb_instances = Vec::new();
+
+        // White keys first (drawn underneath)
+        for pitch in 0..88u8 {
+            if !keyboard::is_black_key(pitch) {
+                let (x, w) = keyboard::key_rect(pitch, screen_w);
+                let color = if active_keys[pitch as usize] {
+                    [0.3, 0.6, 1.0, 1.0]
+                } else {
+                    [0.9, 0.9, 0.9, 1.0]
+                };
+                kb_instances.push(QuadInstance {
+                    pos: [x, keyboard_y],
+                    size: [w - 1.0, keyboard_height],
+                    color,
+                });
+            }
+        }
+
+        // Black keys on top
+        for pitch in 0..88u8 {
+            if keyboard::is_black_key(pitch) {
+                let (x, w) = keyboard::key_rect(pitch, screen_w);
+                let color = if active_keys[pitch as usize] {
+                    [0.2, 0.4, 0.9, 1.0]
+                } else {
+                    [0.15, 0.15, 0.15, 1.0]
+                };
+                kb_instances.push(QuadInstance {
+                    pos: [x, keyboard_y],
+                    size: [w, keyboard_height * 0.65],
+                    color,
+                });
+            }
+        }
+
+        self.queue.write_buffer(
+            &self.keyboard_instance_buffer,
+            0,
+            bytemuck::cast_slice(&kb_instances),
+        );
+        self.keyboard_instance_count = kb_instances.len() as u32;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
