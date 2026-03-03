@@ -19,8 +19,8 @@ fn vs_fullscreen(@builtin(vertex_index) idx: u32) -> FullscreenOutput {
 fn fs_composite(in: FullscreenOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(t_scene, s_scene, in.uv).rgb;
     let bloom = textureSample(t_bloom, s_bloom, in.uv).rgb;
-    let bloom_intensity = 2.0;
+    let bloom_intensity = 1.5;
     let color = scene + bloom * bloom_intensity;
-    // Clamp instead of Reinhard to preserve color saturation
+    // Clamp instead of tone-map — preserves scene brightness
     return vec4<f32>(min(color, vec3<f32>(1.0)), 1.0);
 }

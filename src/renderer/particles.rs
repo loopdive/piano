@@ -49,7 +49,7 @@ impl ParticleSystem {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Particle Pipeline Layout"),
             bind_group_layouts: &[globals_bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -57,12 +57,14 @@ impl ParticleSystem {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_particle",
+                entry_point: Some("vs_particle"),
+                compilation_options: Default::default(),
                 buffers: &[QuadInstance::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_particle",
+                entry_point: Some("fs_particle"),
+                compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState {
@@ -91,7 +93,8 @@ impl ParticleSystem {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         let indices: [u16; 6] = [0, 1, 2, 2, 1, 3];

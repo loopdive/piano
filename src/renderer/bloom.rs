@@ -1,8 +1,8 @@
 use wgpu::util::DeviceExt;
 
 /// Offscreen texture format used for all bloom render targets.
-/// Rgba8Unorm is chosen for WebGL2 compatibility.
-const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Rgba16Float eliminates banding in bloom gradients.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Multi-pass bloom post-processing renderer.
 ///
@@ -68,7 +68,7 @@ impl BloomRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -164,7 +164,7 @@ impl BloomRenderer {
         );
 
         // ---- Blur uniform buffers ----
-        let blur_spread = 4.0; // wider blur for visible glow
+        let blur_spread = 6.0; // wider blur for smooth visible glow
         let blur_h_uniforms = BlurUniforms {
             direction: [blur_spread / width as f32, 0.0],
             _padding: [0.0; 2],
@@ -257,10 +257,12 @@ impl BloomRenderer {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.extract_pipeline);
         pass.set_bind_group(0, &self.extract_bind_group, &[]);
@@ -278,10 +280,12 @@ impl BloomRenderer {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.blur_pipeline);
         pass.set_bind_group(0, &self.blur_h_tex_bind_group, &[]);
@@ -300,10 +304,12 @@ impl BloomRenderer {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.blur_pipeline);
         pass.set_bind_group(0, &self.blur_v_tex_bind_group, &[]);
@@ -326,10 +332,12 @@ impl BloomRenderer {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.composite_pipeline);
         pass.set_bind_group(0, &self.composite_scene_bind_group, &[]);
@@ -388,7 +396,7 @@ impl BloomRenderer {
         // The buffers have COPY_DST usage so they will be written in the next frame
         // via queue.write_buffer from the caller. We store the new values here
         // by recreating the uniform bind groups (buffers themselves are reused).
-        let blur_spread = 4.0;
+        let blur_spread = 6.0;
         let blur_h_uniforms = BlurUniforms {
             direction: [blur_spread / width as f32, 0.0],
             _padding: [0.0; 2],
@@ -493,7 +501,7 @@ fn create_extract_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Extract Pipeline Layout"),
         bind_group_layouts: &[texture_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -501,12 +509,14 @@ fn create_extract_pipeline(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_fullscreen",
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_extract",
+            entry_point: Some("fs_extract"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: OFFSCREEN_FORMAT,
                 blend: None,
@@ -519,7 +529,8 @@ fn create_extract_pipeline(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     })
 }
 
@@ -536,7 +547,7 @@ fn create_blur_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Blur Pipeline Layout"),
         bind_group_layouts: &[texture_bgl, blur_uniform_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -544,12 +555,14 @@ fn create_blur_pipeline(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_fullscreen",
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_blur",
+            entry_point: Some("fs_blur"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: OFFSCREEN_FORMAT,
                 blend: None,
@@ -562,7 +575,8 @@ fn create_blur_pipeline(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     })
 }
 
@@ -580,7 +594,7 @@ fn create_composite_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Composite Pipeline Layout"),
         bind_group_layouts: &[texture_bgl, texture_bgl],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -588,12 +602,14 @@ fn create_composite_pipeline(
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: "vs_fullscreen",
+            entry_point: Some("vs_fullscreen"),
+            compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: "fs_composite",
+            entry_point: Some("fs_composite"),
+            compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend: None,
@@ -606,6 +622,7 @@ fn create_composite_pipeline(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
+        cache: None,
     })
 }

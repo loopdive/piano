@@ -6,98 +6,98 @@ pub mod note;
 pub mod renderer;
 
 use std::iter;
+use std::sync::Arc;
+use std::sync::Mutex;
 use winit::{
+    application::ApplicationHandler,
     event::*,
-    event_loop::EventLoop,
+    event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
+    window::{Window, WindowId},
 };
 
+use renderer::keys::KeyInstance3D;
 use renderer::quad::QuadInstance;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-/// Probe WebGPU by creating a device with the same deprecated limit names
-/// that wgpu 0.19 sends.  If the browser rejects them (newer WebGPU spec),
-/// we know wgpu will fail too, so we fall back to WebGL2 before the canvas
-/// context gets poisoned.
-///
-/// TODO(wgpu>=0.20): wgpu 0.20+ replaced `maxInterStageShaderComponents`
-/// with `maxInterStageShaderVariables`.  Once we upgrade wgpu, simplify
-/// this probe to a plain `navigator.gpu` existence check (or remove it
-/// entirely if wgpu handles the fallback internally).
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(inline_js = "
-export async function check_webgpu_support() {
-    if (!navigator.gpu) return false;
-    try {
-        const adapter = await navigator.gpu.requestAdapter();
-        if (!adapter) return false;
-        // wgpu 0.19 requests the deprecated maxInterStageShaderComponents
-        // limit.  If the browser rejects it, wgpu cannot use WebGPU either.
-        const device = await adapter.requestDevice({
-            requiredLimits: { maxInterStageShaderComponents: 60 }
-        });
-        device.destroy();
-        return true;
-    } catch (e) {
-        console.warn('WebGPU probe failed (wgpu 0.19 compat):', e.message);
-        return false;
+// Global pending MIDI data — set by JS, consumed by the render loop
+static PENDING_MIDI: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Check if URL has ?keyboard=quad (WASM only, defaults to false = use 3D keys)
+fn use_quad_keyboard() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(win) = web_sys::window() {
+            if let Ok(search) = win.location().search() {
+                return search.contains("keyboard=quad");
+            }
+        }
     }
-}
-")]
-extern "C" {
-    fn check_webgpu_support() -> js_sys::Promise;
+    false
 }
 
-struct State<'a> {
-    surface: wgpu::Surface<'a>,
+/// Load a MIDI file from JavaScript. The bytes will be parsed on the next frame.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn load_midi(data: &[u8]) {
+    *PENDING_MIDI.lock().unwrap() = Some(data.to_vec());
+    log::info!("MIDI file queued ({} bytes)", data.len());
+}
+
+// -- GPU state --
+
+struct State {
+    surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
-    window: &'a Window,
+    window: Arc<Window>,
     quad_renderer: renderer::quad::QuadRenderer,
+    screen_quad_renderer: renderer::quad::QuadRenderer,
     bloom: renderer::bloom::BloomRenderer,
     particle_system: renderer::particles::ParticleSystem,
+    key_renderer: renderer::keys::KeyRenderer,
+    use_3d_keys: bool,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
-    #[allow(dead_code)] // used only on wasm32
+    key_instances_3d: Vec<KeyInstance3D>,
+    #[allow(dead_code)]
     start_time: f64,
     current_time: f64,
+    last_wall_time: f64,
     song: note::Song,
     note_instance_buffer: wgpu::Buffer,
     note_instance_count: u32,
     #[cfg(target_arch = "wasm32")]
     audio_player: Option<audio::AudioPlayer>,
     triggered_notes: Vec<bool>,
+    key_press_state: [f32; 88],
+    surface_configured: bool,
+    paused: bool,
+    rewind_target: Option<f64>,
+    // Drag-to-scrub state
+    cursor_y: f64,
+    drag_active: bool,
+    drag_prev_y: f64,
+    scroll_velocity: f64,
+    was_paused_before_drag: bool,
 }
 
-impl<'a> State<'a> {
-    async fn new(window: &'a Window) -> State<'a> {
+impl State {
+    async fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
-        // Probe for real WebGPU support before creating the wgpu instance.
-        // This avoids poisoning the canvas GL context if WebGPU device creation fails.
-        #[cfg(target_arch = "wasm32")]
-        let webgpu_available = wasm_bindgen_futures::JsFuture::from(check_webgpu_support())
-            .await
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
             #[cfg(target_arch = "wasm32")]
-            backends: if webgpu_available {
-                wgpu::Backends::BROWSER_WEBGPU
-            } else {
-                wgpu::Backends::GL
-            },
+            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
             ..Default::default()
         });
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance.create_surface(window.clone()).unwrap();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -114,14 +114,14 @@ impl<'a> State<'a> {
             _ => wgpu::Limits::default(),
         };
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits,
+                memory_hints: Default::default(),
+                trace: wgpu::Trace::Off,
+                experimental_features: Default::default(),
+            })
             .await
             .unwrap();
         let surface_caps = surface.get_capabilities(&adapter);
@@ -142,10 +142,16 @@ impl<'a> State<'a> {
             view_formats: vec![],
         };
 
-        // QuadRenderer targets the offscreen texture format (Rgba8Unorm), not the surface
+        // QuadRenderer for offscreen (notes/particles → bloom source)
         let quad_renderer = renderer::quad::QuadRenderer::new(
             &device,
             renderer::bloom::BloomRenderer::offscreen_format(),
+        );
+
+        // QuadRenderer for screen (keyboard BG → swapchain, drawn after composite)
+        let screen_quad_renderer = renderer::quad::QuadRenderer::new(
+            &device,
+            surface_format,
         );
 
         let bloom = renderer::bloom::BloomRenderer::new(
@@ -161,16 +167,24 @@ impl<'a> State<'a> {
             renderer::bloom::BloomRenderer::offscreen_format(),
         );
 
+        // KeyRenderer targets swapchain format (drawn after composite, on top of bloom)
+        let key_renderer = renderer::keys::KeyRenderer::new(
+            &device,
+            surface_format,
+            size.width,
+            size.height,
+        );
+        let use_3d_keys = !use_quad_keyboard();
+
         let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Keyboard Instances"),
-            size: (88 * std::mem::size_of::<QuadInstance>()) as u64,
+            size: (400 * std::mem::size_of::<QuadInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let keyboard_instance_count = 0;
 
         let start_time = 0.0;
-        let song = note::demo_song();
+        let song = note::default_song();
         let triggered_notes = vec![false; song.notes.len()];
 
         #[cfg(target_arch = "wasm32")]
@@ -184,27 +198,43 @@ impl<'a> State<'a> {
 
         Self {
             surface, device, queue, config, size, window,
-            quad_renderer, bloom, particle_system,
-            keyboard_instance_buffer, keyboard_instance_count,
-            start_time, current_time: 0.0, song, note_instance_buffer,
+            quad_renderer, screen_quad_renderer, bloom, particle_system,
+            key_renderer, use_3d_keys,
+            keyboard_instance_buffer, keyboard_instance_count: 0,
+            key_instances_3d: Vec::new(),
+            start_time, current_time: 0.0, last_wall_time: 0.0, song, note_instance_buffer,
             note_instance_count: 0,
             #[cfg(target_arch = "wasm32")]
             audio_player,
             triggered_notes,
+            key_press_state: [0.0; 88],
+            surface_configured: false,
+            paused: false,
+            rewind_target: None,
+            cursor_y: 0.0,
+            drag_active: false,
+            drag_prev_y: 0.0,
+            scroll_velocity: 0.0,
+            was_paused_before_drag: false,
         }
     }
 
-    fn window(&self) -> &Window { &self.window }
-
     #[allow(unused_variables)]
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        // On WASM, use the canvas buffer dimensions (which we control)
-        // rather than the reported physical size (which includes DPR scaling).
+        // On WASM, recalculate canvas buffer size from CSS viewport * DPR
         #[cfg(target_arch = "wasm32")]
         let new_size = {
             use winit::platform::web::WindowExtWebSys;
             let canvas = self.window.canvas().unwrap();
-            winit::dpi::PhysicalSize::new(canvas.width(), canvas.height())
+            let win = web_sys::window().unwrap();
+            let dpr = win.device_pixel_ratio();
+            let css_w = win.inner_width().unwrap().as_f64().unwrap();
+            let css_h = win.inner_height().unwrap().as_f64().unwrap();
+            let pw = (css_w * dpr) as u32;
+            let ph = (css_h * dpr) as u32;
+            canvas.set_width(pw);
+            canvas.set_height(ph);
+            winit::dpi::PhysicalSize::new(pw, ph)
         };
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -213,7 +243,14 @@ impl<'a> State<'a> {
             self.surface.configure(&self.device, &self.config);
             self.bloom
                 .resize(&self.device, new_size.width, new_size.height);
+            self.key_renderer
+                .resize(&self.device, new_size.width, new_size.height);
             self.quad_renderer.update_globals(
+                &self.queue,
+                new_size.width as f32,
+                new_size.height as f32,
+            );
+            self.screen_quad_renderer.update_globals(
                 &self.queue,
                 new_size.width as f32,
                 new_size.height as f32,
@@ -221,59 +258,247 @@ impl<'a> State<'a> {
         }
     }
 
-    fn input(&mut self, _event: &WindowEvent) -> bool { false }
+    fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            // Track cursor position for mouse drag
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_y = position.y;
+                return self.drag_active;
+            }
+            // Mouse drag start/end
+            WindowEvent::MouseInput {
+                state: elem_state,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                match elem_state {
+                    ElementState::Pressed => {
+                        self.drag_active = true;
+                        self.drag_prev_y = self.cursor_y;
+                        self.scroll_velocity = 0.0;
+                        self.was_paused_before_drag = self.paused;
+                        self.rewind_target = None;
+                        return true;
+                    }
+                    ElementState::Released => {
+                        self.drag_active = false;
+                        return true;
+                    }
+                }
+            }
+            // Touch drag
+            WindowEvent::Touch(touch) => {
+                match touch.phase {
+                    winit::event::TouchPhase::Started => {
+                        self.cursor_y = touch.location.y;
+                        self.drag_active = true;
+                        self.drag_prev_y = self.cursor_y;
+                        self.scroll_velocity = 0.0;
+                        self.was_paused_before_drag = self.paused;
+                        self.rewind_target = None;
+                        return true;
+                    }
+                    winit::event::TouchPhase::Moved => {
+                        self.cursor_y = touch.location.y;
+                        return true;
+                    }
+                    winit::event::TouchPhase::Ended
+                    | winit::event::TouchPhase::Cancelled => {
+                        self.drag_active = false;
+                        return true;
+                    }
+                }
+            }
+            // Keyboard shortcuts
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(code),
+                    ..
+                },
+                ..
+            } => {
+                match code {
+                    KeyCode::Space => {
+                        self.paused = !self.paused;
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        self.rewind_target = Some(0.0);
+                        self.paused = false;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        false
+    }
 
     fn update(&mut self) {
-        // Time tracking
+        // Check for pending MIDI data
+        if let Some(midi_data) = PENDING_MIDI.lock().unwrap().take() {
+            match note::parse_midi(&midi_data) {
+                Ok(song) => {
+                    log::info!("Loaded MIDI: {} notes, {:.0} BPM", song.notes.len(), song.bpm);
+                    self.triggered_notes = vec![false; song.notes.len()];
+                    self.song = song;
+                    self.current_time = 0.0;
+                    self.paused = false;
+                    self.rewind_target = None;
+                    self.particle_system.particles.clear();
+                }
+                Err(e) => log::error!("Failed to parse MIDI: {e}"),
+            }
+        }
+
+        // Time tracking with pause & rewind support
+        let wall_now;
         #[cfg(target_arch = "wasm32")]
         {
             let perf = web_sys::window().unwrap().performance().unwrap();
-            self.current_time = perf.now() / 1000.0 - self.start_time;
+            wall_now = perf.now() / 1000.0;
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.current_time += 1.0 / 60.0;
+            wall_now = self.last_wall_time + 1.0 / 60.0;
+        }
+        let wall_dt = if self.last_wall_time > 0.0 { wall_now - self.last_wall_time } else { 0.0 };
+        self.last_wall_time = wall_now;
+
+        let scroll_speed = 400.0_f64;
+
+        // Time control priority: drag > momentum > rewind > normal playback
+        if self.drag_active {
+            // User is actively dragging — move time based on cursor delta
+            let delta_y = self.cursor_y - self.drag_prev_y;
+            self.current_time += delta_y / scroll_speed;
+            self.current_time = self.current_time.max(0.0);
+            // Track velocity with exponential smoothing for momentum on release
+            if wall_dt > 0.0 {
+                let instant_vel = delta_y / wall_dt;
+                self.scroll_velocity = self.scroll_velocity * 0.7 + instant_vel * 0.3;
+            }
+            self.drag_prev_y = self.cursor_y;
+            // Reset triggered notes when scrolling backward
+            if delta_y < 0.0 {
+                self.triggered_notes.fill(false);
+            }
+        } else if self.scroll_velocity.abs() > 1.0 {
+            // Momentum scrolling after drag release (friction deceleration)
+            let friction = 8.0;
+            self.scroll_velocity *= (-friction * wall_dt).exp();
+            let delta_y = self.scroll_velocity * wall_dt;
+            self.current_time += delta_y / scroll_speed;
+            self.current_time = self.current_time.max(0.0);
+            if delta_y < 0.0 {
+                self.triggered_notes.fill(false);
+            }
+            // When momentum dies, resume normal playback if it was playing before drag
+            if self.scroll_velocity.abs() <= 1.0 {
+                self.scroll_velocity = 0.0;
+                self.paused = self.was_paused_before_drag;
+            }
+        } else if let Some(target) = self.rewind_target {
+            let rewind_speed = 8.0;
+            let step = wall_dt * rewind_speed * (self.current_time.max(1.0));
+            self.current_time -= step;
+            if self.current_time <= target {
+                self.current_time = target;
+                self.rewind_target = None;
+                self.triggered_notes.fill(false);
+                self.particle_system.particles.clear();
+            }
+        } else if !self.paused {
+            self.current_time += wall_dt;
         }
 
         let screen_w = self.size.width as f32;
         let screen_h = self.size.height as f32;
-        let keyboard_height = screen_h * 0.2;
-        let keyboard_y = screen_h - keyboard_height;
-        let scroll_speed = 200.0; // pixels per second
+        let bottom_margin = screen_h * 0.03;
+        let keyboard_height = screen_h * 0.18;
+        let keyboard_y = screen_h - keyboard_height - bottom_margin;
+        let scroll_speed_f = scroll_speed as f32;
         let t = self.current_time as f32;
 
         let mut note_instances = Vec::new();
 
         for n in &self.song.notes {
+            // Skip notes outside visible keyboard range
+            if !keyboard::is_visible(n.pitch) { continue; }
+
             // Note bottom reaches keyboard_y when t == n.start_time
-            let note_bottom_y = keyboard_y - (n.start_time - t) * scroll_speed;
-            let note_height = n.duration * scroll_speed;
+            let note_bottom_y = keyboard_y - (n.start_time - t) * scroll_speed_f;
+            let note_height = n.duration * scroll_speed_f;
             let note_top_y = note_bottom_y - note_height;
 
             // Skip if off screen
-            if note_bottom_y < 0.0 || note_top_y > keyboard_y {
+            let note_clip_y = keyboard_y - keyboard_height * 0.16;
+            if note_bottom_y < 0.0 || note_top_y > note_clip_y {
                 continue;
             }
 
             let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
 
-            // Clamp to fall area
+            // Add vertical gap between consecutive notes
+            let note_gap = 4.0;
+            let note_top_y = note_top_y + note_gap * 0.5;
+            let note_bottom_y = note_bottom_y - note_gap * 0.5;
+
+            // Clamp to fall area (stop notes above keyboard so they don't bleed into 3D keys)
+            let note_clip_y = keyboard_y - keyboard_height * 0.16;
             let visible_top = note_top_y.max(0.0);
-            let visible_bottom = note_bottom_y.min(keyboard_y);
+            let visible_bottom = note_bottom_y.min(note_clip_y);
             if visible_bottom <= visible_top {
                 continue;
             }
 
-            // Color gradient by pitch: deep blue (low) → cyan (mid) → light blue (high)
+            // Bright cyan/blue notes matching reference
             let pr = n.pitch as f32 / 87.0;
-            let r = (0.15 + pr * 0.35) * n.velocity;
-            let g = (0.3 + pr * 0.5) * n.velocity;
-            let b = (0.8 + pr * 0.2) * n.velocity;
+            let r = (0.08 + pr * 0.25) * n.velocity;
+            let g = (0.45 + pr * 0.35) * n.velocity;
+            let b = (0.95 + pr * 0.05) * n.velocity;
 
+            // All notes same width (based on white key width), centered on key
+            let note_w = key_w;
+            let note_x = key_x;
+            let inset = 2.0;
             note_instances.push(QuadInstance {
-                pos: [key_x, visible_top],
-                size: [key_w, visible_bottom - visible_top],
+                pos: [note_x + inset, visible_top],
+                size: [note_w - inset * 2.0, visible_bottom - visible_top],
                 color: [r, g, b, 1.0],
+            });
+        }
+
+        // Vertical key lane separator lines (very subtle white lines between white keys)
+        let note_clip_y_lines = keyboard_y - keyboard_height * 0.16;
+        for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
+            if keyboard::is_black_key(pitch) { continue; }
+            let (x, _w) = keyboard::key_rect(pitch, screen_w);
+            // Line at left edge of each white key
+            if x > 0.5 {
+                note_instances.push(QuadInstance {
+                    pos: [x, 0.0],
+                    size: [1.0, note_clip_y_lines],
+                    color: [1.0, 1.0, 1.0, 0.04],
+                });
+            }
+        }
+
+        // Upward-fading hazy glow at the front panel top (where notes disappear)
+        let glow_base = keyboard_y - keyboard_height * 0.16; // top of front panel
+        let glow_layers: &[(f32, f32, [f32; 4])] = &[
+            (0.0,  2.0,  [0.20, 0.50, 1.0, 0.9]),  // bright core line
+            (2.0,  8.0,  [0.12, 0.35, 0.85, 0.4]),  // near glow
+            (10.0, 18.0, [0.08, 0.25, 0.65, 0.15]), // mid haze
+            (28.0, 30.0, [0.04, 0.15, 0.45, 0.06]), // outer fade
+        ];
+        for &(offset, h, color) in glow_layers {
+            note_instances.push(QuadInstance {
+                pos: [0.0, glow_base - offset - h],
+                size: [screen_w, h],
+                color,
             });
         }
 
@@ -294,14 +519,26 @@ impl<'a> State<'a> {
             }
         }
 
-        // Trigger audio for notes hitting the keyboard
+        // Smooth key press animation (exponential ease toward target)
+        let press_speed = 18.0_f32; // speed of press-down
+        let release_speed = 8.0_f32; // speed of release (slower for realism)
+        for i in 0..88 {
+            let target = if active_keys[i] { 1.0 } else { 0.0 };
+            let speed = if active_keys[i] { press_speed } else { release_speed };
+            self.key_press_state[i] += (target - self.key_press_state[i]) * (speed * wall_dt as f32).min(1.0);
+        }
+
+        // Trigger audio for notes hitting the keyboard (only during normal playback, not scrolling)
+        let is_scrolling = self.drag_active || self.scroll_velocity.abs() > 1.0;
         for (i, n) in self.song.notes.iter().enumerate() {
             let is_active = t >= n.start_time && t < n.start_time + n.duration;
             if is_active && !self.triggered_notes[i] {
                 self.triggered_notes[i] = true;
                 #[cfg(target_arch = "wasm32")]
-                if let Some(ref player) = self.audio_player {
-                    let _ = player.play_note(n.pitch, n.velocity);
+                if !is_scrolling {
+                    if let Some(ref player) = self.audio_player {
+                        let _ = player.play_note(n.pitch, n.velocity, n.duration);
+                    }
                 }
             }
         }
@@ -309,16 +546,17 @@ impl<'a> State<'a> {
         // Spawn particles for active notes touching the keyboard
         let dt = 1.0 / 60.0;
         for n in &self.song.notes {
+            if !keyboard::is_visible(n.pitch) { continue; }
             if t >= n.start_time && t < n.start_time + n.duration {
                 let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
                 let spawn_x = key_x + key_w / 2.0;
                 let spawn_y = keyboard_y;
 
                 let pr = n.pitch as f32 / 87.0;
-                let color = [0.2 + pr * 0.3, 0.4 + pr * 0.4, 0.9 + pr * 0.1];
+                let color = [0.3 + pr * 0.4, 0.6 + pr * 0.3, 1.0];
 
-                // Spawn 1-2 particles per frame per active note
-                self.particle_system.spawn(spawn_x, spawn_y, color, 2);
+                // Spawn 2-3 particles per frame per active note
+                self.particle_system.spawn(spawn_x, spawn_y, color, 3);
             }
         }
         self.particle_system.update(dt);
@@ -329,65 +567,213 @@ impl<'a> State<'a> {
             .fold(0.0_f32, f32::max);
 
         if t > song_duration + 2.0 {
-            // Reset time
-            #[cfg(target_arch = "wasm32")]
-            {
-                let perf = web_sys::window().unwrap().performance().unwrap();
-                self.start_time = perf.now() / 1000.0;
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.current_time = 0.0;
-            }
-            // Reset triggered notes
+            self.current_time = 0.0;
             self.triggered_notes.fill(false);
-            // Clear particles
             self.particle_system.particles.clear();
         }
 
-        // Rebuild keyboard instances with highlighting
-        let mut kb_instances = Vec::new();
+        // Rebuild keyboard instances
+        if self.use_3d_keys {
+            // 3D key instances
+            let mut keys_3d = Vec::new();
+            let gap = 1.5_f32;
+            let key_depth_px = keyboard_height * 0.95;
+            let bk_depth_px = keyboard_height * 0.60;
 
-        // White keys first (drawn underneath)
-        for pitch in 0..88u8 {
-            if !keyboard::is_black_key(pitch) {
+            // White keys first, then black keys (depth buffer handles ordering)
+            for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 let (x, w) = keyboard::key_rect(pitch, screen_w);
-                let color = if active_keys[pitch as usize] {
-                    [0.5, 0.7, 1.0, 1.0]
-                } else {
-                    [0.22, 0.22, 0.25, 1.0]
-                };
-                kb_instances.push(QuadInstance {
-                    pos: [x, keyboard_y],
-                    size: [w - 1.0, keyboard_height],
-                    color,
-                });
-            }
-        }
+                let is_black = keyboard::is_black_key(pitch);
+                let press = self.key_press_state[pitch as usize];
 
-        // Black keys on top
-        for pitch in 0..88u8 {
-            if keyboard::is_black_key(pitch) {
-                let (x, w) = keyboard::key_rect(pitch, screen_w);
-                let color = if active_keys[pitch as usize] {
-                    [0.3, 0.5, 0.9, 1.0]
+                // Blend colors smoothly using press value (not binary active flag)
+                let p = press;
+                if is_black {
+                    keys_3d.push(KeyInstance3D {
+                        pos_x: x,
+                        key_width: w,
+                        key_height: keyboard_height * 0.12,
+                        key_depth: bk_depth_px,
+                        press,
+                        is_black: 1.0,
+                        color: [
+                            0.05 + p * 0.07,
+                            0.05 + p * 0.07,
+                            0.07 + p * 0.08,
+                            1.0,
+                        ],
+                    });
                 } else {
-                    [0.06, 0.06, 0.08, 1.0]
-                };
-                kb_instances.push(QuadInstance {
-                    pos: [x, keyboard_y],
-                    size: [w, keyboard_height * 0.65],
-                    color,
-                });
+                    keys_3d.push(KeyInstance3D {
+                        pos_x: x + gap * 0.5,
+                        key_width: w - gap,
+                        key_height: keyboard_height * 0.06,
+                        key_depth: key_depth_px,
+                        press,
+                        is_black: 0.0,
+                        color: [
+                            0.82 + p * 0.06,
+                            0.80 + p * 0.06,
+                            0.77 + p * 0.06,
+                            1.0,
+                        ],
+                    });
+                }
             }
-        }
+            self.key_instances_3d = keys_3d;
 
-        self.queue.write_buffer(
-            &self.keyboard_instance_buffer,
-            0,
-            bytemuck::cast_slice(&kb_instances),
-        );
-        self.keyboard_instance_count = kb_instances.len() as u32;
+            // Dark background quad behind keyboard area
+            // Front panel just above black key height (0.12) for a piano-back look
+            let front_panel_h = keyboard_height * 0.16;
+            let bg_margin = front_panel_h + 4.0;
+            let mut kb_instances = Vec::new();
+            // Main dark background
+            kb_instances.push(QuadInstance {
+                pos: [0.0, keyboard_y - bg_margin],
+                size: [screen_w, keyboard_height + bottom_margin + bg_margin],
+                color: [0.02, 0.02, 0.03, 1.0],
+            });
+            // Front panel strip — dark lip above the keys so notes vanish behind it
+            kb_instances.push(QuadInstance {
+                pos: [0.0, keyboard_y - front_panel_h],
+                size: [screen_w, front_panel_h],
+                color: [0.06, 0.06, 0.07, 1.0],
+            });
+            // Subtle highlight line at the very top edge of the front panel
+            kb_instances.push(QuadInstance {
+                pos: [0.0, keyboard_y - front_panel_h],
+                size: [screen_w, 1.0],
+                color: [0.12, 0.12, 0.14, 1.0],
+            });
+            self.queue.write_buffer(
+                &self.keyboard_instance_buffer,
+                0,
+                bytemuck::cast_slice(&kb_instances),
+            );
+            self.keyboard_instance_count = kb_instances.len() as u32;
+        } else {
+            // Quad-based keyboard (fallback via ?keyboard=quad)
+            let mut kb_instances = Vec::new();
+            let gap = 1.5_f32;
+            let bk_height = keyboard_height * 0.62;
+            let spot_h = keyboard_height * 0.15;
+
+            kb_instances.push(QuadInstance {
+                pos: [0.0, keyboard_y],
+                size: [screen_w, keyboard_height + bottom_margin],
+                color: [0.02, 0.02, 0.03, 1.0],
+            });
+
+            for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
+                if !keyboard::is_black_key(pitch) {
+                    let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let active = active_keys[pitch as usize];
+                    let kx = x + gap * 0.5;
+                    let kw = w - gap;
+
+                    if active {
+                        let press_depth = 5.0;
+                        let taper = 1.5;
+                        kb_instances.push(QuadInstance {
+                            pos: [kx, keyboard_y], size: [kw, press_depth],
+                            color: [0.08, 0.07, 0.06, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx + taper, keyboard_y + press_depth],
+                            size: [kw - taper * 2.0, keyboard_height - press_depth],
+                            color: [0.80, 0.78, 0.75, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx + taper, keyboard_y + press_depth],
+                            size: [kw - taper * 2.0, spot_h],
+                            color: [0.88, 0.86, 0.83, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx, keyboard_y + press_depth],
+                            size: [taper, keyboard_height - press_depth],
+                            color: [0.25, 0.24, 0.22, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx + kw - taper, keyboard_y + press_depth],
+                            size: [taper, keyboard_height - press_depth],
+                            color: [0.35, 0.34, 0.32, 1.0],
+                        });
+                    } else {
+                        kb_instances.push(QuadInstance {
+                            pos: [kx, keyboard_y], size: [kw, keyboard_height],
+                            color: [0.72, 0.70, 0.67, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx, keyboard_y], size: [kw, spot_h],
+                            color: [0.92, 0.90, 0.87, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [kx, keyboard_y + keyboard_height - spot_h],
+                            size: [kw, spot_h],
+                            color: [0.45, 0.43, 0.40, 1.0],
+                        });
+                    }
+                }
+            }
+
+            for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
+                if keyboard::is_black_key(pitch) {
+                    let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let active = active_keys[pitch as usize];
+                    let bk_spot = bk_height * 0.18;
+
+                    if active {
+                        let press_depth = 3.0;
+                        let taper = 1.0;
+                        kb_instances.push(QuadInstance {
+                            pos: [x, keyboard_y], size: [w, press_depth],
+                            color: [0.01, 0.01, 0.02, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x + taper, keyboard_y + press_depth],
+                            size: [w - taper * 2.0, bk_height - press_depth],
+                            color: [0.10, 0.10, 0.13, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x + taper, keyboard_y + press_depth],
+                            size: [w - taper * 2.0, bk_spot],
+                            color: [0.22, 0.22, 0.26, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x, keyboard_y + press_depth],
+                            size: [taper, bk_height - press_depth],
+                            color: [0.02, 0.02, 0.03, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x + w - taper, keyboard_y + press_depth],
+                            size: [taper, bk_height - press_depth],
+                            color: [0.03, 0.03, 0.04, 1.0],
+                        });
+                    } else {
+                        kb_instances.push(QuadInstance {
+                            pos: [x, keyboard_y], size: [w, bk_height],
+                            color: [0.05, 0.05, 0.07, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x, keyboard_y], size: [w, bk_spot],
+                            color: [0.14, 0.14, 0.18, 1.0],
+                        });
+                        kb_instances.push(QuadInstance {
+                            pos: [x + 1.0, keyboard_y + bk_height - 3.0],
+                            size: [w - 2.0, 3.0],
+                            color: [0.02, 0.02, 0.03, 1.0],
+                        });
+                    }
+                }
+            }
+
+            self.queue.write_buffer(
+                &self.keyboard_instance_buffer,
+                0,
+                bytemuck::cast_slice(&kb_instances),
+            );
+            self.keyboard_instance_count = kb_instances.len() as u32;
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -401,6 +787,11 @@ impl<'a> State<'a> {
             self.size.width as f32,
             self.size.height as f32,
         );
+        self.screen_quad_renderer.update_globals(
+            &self.queue,
+            self.size.width as f32,
+            self.size.height as f32,
+        );
 
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor {
@@ -408,10 +799,10 @@ impl<'a> State<'a> {
             },
         );
 
-        // Pass 1: Scene -> offscreen texture
+        // Pass 1: Notes + particles -> offscreen texture (bloom source)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Scene Pass"),
+                label: Some("Notes Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: self.bloom.scene_view(),
                     resolve_target: None,
@@ -419,43 +810,83 @@ impl<'a> State<'a> {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
-            // Draw notes first (behind keyboard)
             if self.note_instance_count > 0 {
-                self.quad_renderer.draw(
+                self.quad_renderer.draw_notes(
                     &mut pass,
                     &self.note_instance_buffer,
                     self.note_instance_count,
                 );
             }
-            // Draw keyboard on top
-            self.quad_renderer.draw(
-                &mut pass,
-                &self.keyboard_instance_buffer,
-                self.keyboard_instance_count,
-            );
-            // Draw particles with additive blending (after keyboard, still in scene pass)
             self.particle_system.draw(
                 &mut pass,
-                self.quad_renderer.globals_bind_group(),
+                self.quad_renderer.globals_bind_group_notes(),
                 &self.queue,
             );
         }
 
-        // Pass 2: Bright extract
+        // Pass 2: Bloom extract
         self.bloom.extract_pass(&mut encoder);
-        // Pass 3-4: First blur iteration (wide glow)
+        // Pass 3-4: Gaussian blur (H then V)
         self.bloom.blur_h_pass(&mut encoder);
         self.bloom.blur_v_pass(&mut encoder);
-        // Pass 5-6: Second blur iteration (wider, softer glow)
-        self.bloom.blur_h_pass(&mut encoder);
-        self.bloom.blur_v_pass(&mut encoder);
-        // Pass 7: Composite -> swapchain
+
+        // Pass 5: Composite (scene + bloom) -> swapchain
         self.bloom.composite_pass(&mut encoder, &screen_view);
+
+        // Pass 6: Keyboard BG drawn ON TOP of composited screen (no bloom bleed)
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Keyboard BG Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &screen_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            self.screen_quad_renderer.draw(
+                &mut pass,
+                &self.keyboard_instance_buffer,
+                self.keyboard_instance_count,
+            );
+        }
+
+        // Pass 7: 3D keys on top of screen (has its own depth buffer)
+        if self.use_3d_keys && !self.key_instances_3d.is_empty() {
+            let screen_h = self.size.height as f32;
+            let bottom_margin = screen_h * 0.03;
+            let keyboard_height = screen_h * 0.18;
+            let keyboard_y = screen_h - keyboard_height - bottom_margin;
+            let max_depth = keyboard_height * 0.95;
+            self.key_renderer.update_uniforms(
+                &self.queue,
+                self.size.width as f32,
+                screen_h,
+                keyboard_y,
+                keyboard_height,
+                max_depth,
+            );
+            self.key_renderer.draw(
+                &mut encoder,
+                &screen_view,
+                &self.key_instances_3d,
+                &self.queue,
+            );
+        }
 
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
@@ -463,8 +894,119 @@ impl<'a> State<'a> {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-pub async fn run() {
+// -- Application shell (winit 0.30 ApplicationHandler) --
+
+struct App {
+    state: Option<State>,
+    #[cfg(target_arch = "wasm32")]
+    proxy: Option<winit::event_loop::EventLoopProxy<State>>,
+}
+
+impl ApplicationHandler<State> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() { return; }
+
+        #[allow(unused_mut)]
+        let mut attrs = Window::default_attributes().with_title("Piano Fall");
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowAttributesExtWebSys;
+
+            let win = web_sys::window().unwrap();
+            let doc = win.document().unwrap();
+            let canvas = doc
+                .get_element_by_id("canvas")
+                .unwrap()
+                .unchecked_into::<web_sys::HtmlCanvasElement>();
+            // Set canvas buffer to match viewport size * devicePixelRatio for sharp rendering
+            let dpr = win.device_pixel_ratio();
+            let vw = (win.inner_width().unwrap().as_f64().unwrap() * dpr) as u32;
+            let vh = (win.inner_height().unwrap().as_f64().unwrap() * dpr) as u32;
+            canvas.set_width(vw);
+            canvas.set_height(vh);
+            canvas.style().set_property("width", "100%").unwrap();
+            canvas.style().set_property("height", "100%").unwrap();
+            attrs = attrs.with_canvas(Some(canvas));
+        }
+
+        let window = Arc::new(event_loop.create_window(attrs).unwrap());
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.state = Some(pollster::block_on(State::new(window)));
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(proxy) = self.proxy.take() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let state = State::new(window).await;
+                    let _ = proxy.send_event(state);
+                });
+            }
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut state: State) {
+        let size = state.window.inner_size();
+        state.resize(size);
+        state.surface_configured = true;
+        state.window.request_redraw();
+        self.state = Some(state);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = &mut self.state else { return };
+        if state.input(&event) { return; }
+
+        match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    state: ElementState::Pressed,
+                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                    ..
+                },
+                ..
+            } => event_loop.exit(),
+            WindowEvent::Resized(physical_size) => {
+                state.surface_configured = true;
+                state.resize(physical_size);
+            }
+            WindowEvent::RedrawRequested => {
+                state.window.request_redraw();
+                if !state.surface_configured { return; }
+                state.update();
+                match state.render() {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        state.resize(state.size)
+                    }
+                    Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
+                    Err(wgpu::SurfaceError::Timeout) => {
+                        log::warn!("Surface timeout")
+                    }
+                    Err(e) => {
+                        log::error!("Surface error: {e:?}");
+                        event_loop.exit();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// -- Entry points --
+
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     cfg_if::cfg_if! {
         if #[cfg(target_arch = "wasm32")] {
             std::panic::set_hook(Box::new(console_error_panic_hook::hook));
@@ -474,75 +1016,23 @@ pub async fn run() {
         }
     }
 
-    let event_loop = EventLoop::new().unwrap();
-    let window = WindowBuilder::new()
-        .with_title("Piano Fall")
-        .build(&event_loop)
-        .unwrap();
+    let event_loop = EventLoop::<State>::with_user_event().build()?;
 
     #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::WindowExtWebSys;
-        let canvas_el = window.canvas().unwrap();
-        // Set canvas buffer to match CSS container size (ignore DPR for consistent rendering)
-        canvas_el.set_width(1200);
-        canvas_el.set_height(800);
-        canvas_el.style().set_property("width", "100%").unwrap();
-        canvas_el.style().set_property("height", "100%").unwrap();
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| {
-                let dst = doc.get_element_by_id("piano-fall")?;
-                let canvas = web_sys::Element::from(canvas_el);
-                dst.append_child(&canvas).ok()?;
-                Some(())
-            })
-            .expect("Couldn't append canvas to document body.");
-    }
+    let proxy = event_loop.create_proxy();
 
-    let mut state = State::new(&window).await;
-    let mut surface_configured = false;
+    let mut app = App {
+        state: None,
+        #[cfg(target_arch = "wasm32")]
+        proxy: Some(proxy),
+    };
 
-    event_loop
-        .run(move |event, control_flow| match event {
-            Event::WindowEvent { ref event, window_id }
-                if window_id == state.window().id() =>
-            {
-                if !state.input(event) {
-                    match event {
-                        WindowEvent::CloseRequested
-                        | WindowEvent::KeyboardInput {
-                            event: KeyEvent {
-                                state: ElementState::Pressed,
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                ..
-                            },
-                            ..
-                        } => control_flow.exit(),
-                        WindowEvent::Resized(physical_size) => {
-                            surface_configured = true;
-                            state.resize(*physical_size);
-                        }
-                        WindowEvent::RedrawRequested => {
-                            state.window().request_redraw();
-                            if !surface_configured { return; }
-                            state.update();
-                            match state.render() {
-                                Ok(_) => {}
-                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                    state.resize(state.size)
-                                }
-                                Err(wgpu::SurfaceError::OutOfMemory) => control_flow.exit(),
-                                Err(wgpu::SurfaceError::Timeout) => {
-                                    log::warn!("Surface timeout")
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        })
-        .unwrap();
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub fn run_web() -> Result<(), JsValue> {
+    run().map_err(|e| JsValue::from_str(&e.to_string()))
 }

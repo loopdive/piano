@@ -12,25 +12,30 @@ path = "src/main.rs"
 
 [dependencies]
 cfg-if = "1"
-winit = { version = "0.29", features = ["rwh_05"] }
+winit = "0.30"
 env_logger = "0.10"
 log = "0.4"
-wgpu = "0.19"
+wgpu = "28"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+midly = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.6"
 console_log = "1.0"
-wgpu = { version = "0.19", features = ["webgl"] }
+wgpu = { version = "28", features = ["webgl"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
-    "Document", "Window", "Element", "HtmlCanvasElement",
+    "Document", "Window", "Element", "HtmlCanvasElement", "Location",
     "Performance",
-    "AudioContext", "AudioBuffer", "AudioBufferSourceNode",
+    "AudioContext", "AudioContextState",
     "AudioDestinationNode", "AudioNode", "AudioParam",
+    "AudioScheduledSourceNode",
     "BaseAudioContext",
+    "GainNode", "OscillatorNode", "OscillatorType",
+    "AudioBuffer", "AudioBufferSourceNode",
     "Request", "RequestInit", "RequestMode", "Response",
+    "Headers",
 ] }

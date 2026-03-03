@@ -37,8 +37,17 @@ fn vs_particle(
 
 @fragment
 fn fs_particle(in: VertexOutput) -> @location(0) vec4<f32> {
-    let center = vec2<f32>(0.5, 0.5);
-    let dist = length(in.uv - center) * 2.0;
-    let alpha = 1.0 - smoothstep(0.0, 1.0, dist);
-    return vec4<f32>(in.color.rgb * alpha, 1.0);
+    let p = (in.uv - 0.5) * 2.0;
+    let dist = length(p);
+
+    // Bright core
+    let core = exp(-dist * 4.0);
+
+    // Star/sparkle cross arms
+    let ax = exp(-abs(p.y) * 12.0) * exp(-abs(p.x) * 3.0);
+    let ay = exp(-abs(p.x) * 12.0) * exp(-abs(p.y) * 3.0);
+    let sparkle = (ax + ay) * 0.4;
+
+    let brightness = core + sparkle;
+    return vec4<f32>(in.color.rgb * brightness, 1.0);
 }

@@ -1,5 +1,4 @@
-use piano_fall::run;
-
 fn main() {
-    pollster::block_on(run());
+    env_logger::init();
+    piano_fall::run().unwrap();
 }
