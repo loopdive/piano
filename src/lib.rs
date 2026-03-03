@@ -155,6 +155,12 @@ impl<'a> State<'a> {
             self.surface.configure(&self.device, &self.config);
             self.bloom
                 .resize(&self.device, new_size.width, new_size.height);
+            // Update globals uniform so shaders know the new screen dimensions
+            self.quad_renderer.update_globals(
+                &self.queue,
+                new_size.width as f32,
+                new_size.height as f32,
+            );
         }
     }
 
@@ -261,6 +267,28 @@ impl<'a> State<'a> {
             }
         }
         self.particle_system.update(dt);
+
+        // Loop the song: when all notes have passed, restart
+        let song_duration = self.song.notes.iter()
+            .map(|n| n.start_time + n.duration)
+            .fold(0.0_f32, f32::max);
+
+        if t > song_duration + 2.0 {
+            // Reset time
+            #[cfg(target_arch = "wasm32")]
+            {
+                let perf = web_sys::window().unwrap().performance().unwrap();
+                self.start_time = perf.now() / 1000.0;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.current_time = 0.0;
+            }
+            // Reset triggered notes
+            self.triggered_notes.fill(false);
+            // Clear particles
+            self.particle_system.particles.clear();
+        }
 
         // Rebuild keyboard instances with highlighting
         let mut kb_instances = Vec::new();
