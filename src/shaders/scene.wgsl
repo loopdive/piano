@@ -60,8 +60,13 @@ fn fs_quad(in: VertexOutput) -> @location(0) vec4<f32> {
     let border = smoothstep(-2.5, -1.5, d) * (1.0 - smoothstep(-1.5, -0.5, d));
     let border_boost = select(1.0, 1.0 + border * 0.6, is_note);
 
-    // Top-lit spotlight gradient
-    let gradient = 1.0 + (0.5 - in.uv.y) * 0.3;
+    // Notes: onset (bottom, uv.y=1) bright → release (top, uv.y=0) dark
+    // Keyboard: top-lit spotlight
+    let gradient = select(
+        1.0 + (0.5 - in.uv.y) * 0.3,                // keyboard: top-lit
+        0.7 + in.uv.y * 0.5,                          // notes: 0.7 at top (release) → 1.2 at bottom (onset)
+        is_note
+    );
 
     let col = in.color.rgb * gradient * border_boost;
     return vec4<f32>(col, in.color.a * edge_alpha);

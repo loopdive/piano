@@ -11,6 +11,10 @@ extern "C" {
     /// Resume audio context on user gesture
     #[wasm_bindgen(js_namespace = window, js_name = _pianoResume, catch)]
     fn piano_resume() -> Result<(), JsValue>;
+
+    /// Check if all piano samples have finished loading
+    #[wasm_bindgen(js_namespace = window, js_name = _areSamplesReady)]
+    fn are_samples_ready() -> bool;
 }
 
 pub struct AudioPlayer;
@@ -26,5 +30,10 @@ impl AudioPlayer {
         let midi_note = pitch as u32 + 21; // pitch 0 = A0 = MIDI 21
         let _ = piano_resume();
         piano_play(midi_note, velocity, duration)
+    }
+
+    /// Returns true when all piano samples have been loaded.
+    pub fn samples_ready(&self) -> bool {
+        are_samples_ready()
     }
 }

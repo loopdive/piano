@@ -8,6 +8,7 @@ pub mod renderer;
 use std::iter;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::{
     application::ApplicationHandler,
     event::*,
@@ -24,6 +25,8 @@ use wasm_bindgen::prelude::*;
 
 // Global pending MIDI data — set by JS, consumed by the render loop
 static PENDING_MIDI: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// External code (e.g. load_midi) sets this to wake the render loop
+static REDRAW_FLAG: AtomicBool = AtomicBool::new(false);
 
 /// Check if URL has ?keyboard=quad (WASM only, defaults to false = use 3D keys)
 fn use_quad_keyboard() -> bool {
@@ -43,6 +46,7 @@ fn use_quad_keyboard() -> bool {
 #[wasm_bindgen]
 pub fn load_midi(data: &[u8]) {
     *PENDING_MIDI.lock().unwrap() = Some(data.to_vec());
+    REDRAW_FLAG.store(true, Ordering::Relaxed);
     log::info!("MIDI file queued ({} bytes)", data.len());
 }
 
@@ -77,6 +81,8 @@ struct State {
     key_press_state: [f32; 88],
     surface_configured: bool,
     paused: bool,
+    audio_unlocked: bool,
+    waiting_for_samples: bool,
     rewind_target: Option<f64>,
     // Drag-to-scrub state
     cursor_y: f64,
@@ -191,7 +197,7 @@ impl State {
         let audio_player = audio::AudioPlayer::new().ok();
         let note_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Note Instances"),
-            size: (500 * std::mem::size_of::<QuadInstance>()) as u64,
+            size: (2000 * std::mem::size_of::<QuadInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -209,7 +215,9 @@ impl State {
             triggered_notes,
             key_press_state: [0.0; 88],
             surface_configured: false,
-            paused: false,
+            paused: true,
+            audio_unlocked: false,
+            waiting_for_samples: false,
             rewind_target: None,
             cursor_y: 0.0,
             drag_active: false,
@@ -273,6 +281,15 @@ impl State {
             } => {
                 match elem_state {
                     ElementState::Pressed => {
+                        if !self.audio_unlocked {
+                            self.audio_unlocked = true;
+                            #[cfg(target_arch = "wasm32")]
+                            if let Some(ref player) = self.audio_player {
+                                let _ = player.play_note(0, 0.0, 0.0);
+                            }
+                            // Stay paused until samples are loaded
+                            self.waiting_for_samples = true;
+                        }
                         self.drag_active = true;
                         self.drag_prev_y = self.cursor_y;
                         self.scroll_velocity = 0.0;
@@ -290,6 +307,14 @@ impl State {
             WindowEvent::Touch(touch) => {
                 match touch.phase {
                     winit::event::TouchPhase::Started => {
+                        if !self.audio_unlocked {
+                            self.audio_unlocked = true;
+                            #[cfg(target_arch = "wasm32")]
+                            if let Some(ref player) = self.audio_player {
+                                let _ = player.play_note(0, 0.0, 0.0);
+                            }
+                            self.waiting_for_samples = true;
+                        }
                         self.cursor_y = touch.location.y;
                         self.drag_active = true;
                         self.drag_prev_y = self.cursor_y;
@@ -309,6 +334,24 @@ impl State {
                     }
                 }
             }
+            // Mouse wheel: scroll up = rewind, scroll down = fast-forward
+            WindowEvent::MouseWheel { delta, .. } => {
+                let pixels = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y as f64 * 60.0,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y,
+                };
+                // Positive pixels = scroll up = rewind (go back in time)
+                self.current_time -= pixels / 400.0;
+                self.current_time = self.current_time.max(0.0);
+                if pixels > 0.0 {
+                    // Rewinding — reset triggers for future notes
+                    let ct = self.current_time as f32;
+                    for (i, n) in self.song.notes.iter().enumerate() {
+                        if n.start_time > ct { self.triggered_notes[i] = false; }
+                    }
+                }
+                return true;
+            }
             // Keyboard shortcuts
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
@@ -320,7 +363,16 @@ impl State {
             } => {
                 match code {
                     KeyCode::Space => {
-                        self.paused = !self.paused;
+                        if !self.audio_unlocked {
+                            self.audio_unlocked = true;
+                            #[cfg(target_arch = "wasm32")]
+                            if let Some(ref player) = self.audio_player {
+                                let _ = player.play_note(0, 0.0, 0.0); // triggers piano_resume
+                            }
+                            self.waiting_for_samples = true;
+                        } else {
+                            self.paused = !self.paused;
+                        }
                         return true;
                     }
                     KeyCode::Backspace => {
@@ -346,6 +398,7 @@ impl State {
                     self.song = song;
                     self.current_time = 0.0;
                     self.paused = false;
+                    self.audio_unlocked = true;
                     self.rewind_target = None;
                     self.particle_system.particles.clear();
                 }
@@ -369,6 +422,17 @@ impl State {
 
         let scroll_speed = 400.0_f64;
 
+        // Wait for samples to finish loading before starting playback
+        #[cfg(target_arch = "wasm32")]
+        if self.waiting_for_samples {
+            if let Some(ref player) = self.audio_player {
+                if player.samples_ready() {
+                    self.waiting_for_samples = false;
+                    self.paused = false;
+                }
+            }
+        }
+
         // Time control priority: drag > momentum > rewind > normal playback
         if self.drag_active {
             // User is actively dragging — move time based on cursor delta
@@ -381,9 +445,12 @@ impl State {
                 self.scroll_velocity = self.scroll_velocity * 0.7 + instant_vel * 0.3;
             }
             self.drag_prev_y = self.cursor_y;
-            // Reset triggered notes when scrolling backward
+            // Reset triggers only for notes ahead of current time (so they fire once when reached)
             if delta_y < 0.0 {
-                self.triggered_notes.fill(false);
+                let ct = self.current_time as f32;
+                for (i, n) in self.song.notes.iter().enumerate() {
+                    if n.start_time > ct { self.triggered_notes[i] = false; }
+                }
             }
         } else if self.scroll_velocity.abs() > 1.0 {
             // Momentum scrolling after drag release (friction deceleration)
@@ -393,7 +460,10 @@ impl State {
             self.current_time += delta_y / scroll_speed;
             self.current_time = self.current_time.max(0.0);
             if delta_y < 0.0 {
-                self.triggered_notes.fill(false);
+                let ct = self.current_time as f32;
+                for (i, n) in self.song.notes.iter().enumerate() {
+                    if n.start_time > ct { self.triggered_notes[i] = false; }
+                }
             }
             // When momentum dies, resume normal playback if it was playing before drag
             if self.scroll_velocity.abs() <= 1.0 {
@@ -423,6 +493,61 @@ impl State {
         let t = self.current_time as f32;
 
         let mut note_instances = Vec::new();
+        let note_clip_y_grid = keyboard_y - keyboard_height * 0.16;
+        // Grid: vertical line at center of every key lane
+        // White keys: C is brightest white, descending through the octave toward note-blue
+        // Black keys: half brightness, stay white
+        for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
+            let (x, w) = keyboard::key_rect(pitch, screen_w);
+            let semitone = (pitch + 9) % 12; // C=0, C#=1, ..., B=11
+            let is_black = keyboard::is_black_key(pitch);
+            let color = if is_black {
+                [1.0, 1.0, 1.0, 0.12]
+            } else {
+                // Map white keys within octave: C=0, D=1, E=2, F=3, G=4, A=5, B=6
+                let white_pos = match semitone {
+                    0 => 0, 2 => 1, 4 => 2, 5 => 3, 7 => 4, 9 => 5, 11 => 6, _ => 0,
+                };
+                let frac = white_pos as f32 / 6.0; // 0.0 (C) to 1.0 (B)
+                // Blend from white toward note-blue [0.3, 0.7, 1.0]
+                let r = 1.0 * (1.0 - frac) + 0.3 * frac;
+                let g = 1.0 * (1.0 - frac) + 0.7 * frac;
+                let b = 1.0;
+                // Alpha: C brightest (0.44), B dimmest (0.18)
+                let alpha = 0.44 * (1.0 - frac) + 0.18 * frac;
+                [r, g, b, alpha]
+            };
+            note_instances.push(QuadInstance {
+                pos: [x + w * 0.5, 0.0],
+                size: [1.0, note_clip_y_grid],
+                color,
+            });
+        }
+
+        // Grid: horizontal lines at measure and beat boundaries (scroll with notes)
+        // Both arrays are sorted by time. Use a pointer for measure matching.
+        let grid_color_beat = [1.0, 1.0, 1.0, 0.18];
+        let grid_color_measure = [1.0, 1.0, 1.0, 0.30];
+        let mut meas_ptr = 0;
+        for &beat_time in &self.song.beats {
+            let y = keyboard_y - (beat_time - t) * scroll_speed_f;
+            if y < 0.0 { break; } // sorted: all remaining are off-screen above
+            if y > note_clip_y_grid { continue; } // below the note area
+            // Advance measure pointer
+            while meas_ptr < self.song.measures.len()
+                && self.song.measures[meas_ptr] < beat_time - 0.001 {
+                meas_ptr += 1;
+            }
+            let is_measure = meas_ptr < self.song.measures.len()
+                && (self.song.measures[meas_ptr] - beat_time).abs() < 0.001;
+            // Snap to pixel grid to prevent flicker; 2px tall so a full pixel is always covered
+            let y_snapped = y.round();
+            note_instances.push(QuadInstance {
+                pos: [0.0, y_snapped],
+                size: [screen_w, 2.0],
+                color: if is_measure { grid_color_measure } else { grid_color_beat },
+            });
+        }
 
         for n in &self.song.notes {
             // Skip notes outside visible keyboard range
@@ -454,36 +579,20 @@ impl State {
                 continue;
             }
 
-            // Bright cyan/blue notes matching reference
+            // Single quad per note — velocity controls brightness
             let pr = n.pitch as f32 / 87.0;
-            let r = (0.08 + pr * 0.25) * n.velocity;
-            let g = (0.45 + pr * 0.35) * n.velocity;
-            let b = (0.95 + pr * 0.05) * n.velocity;
+            let vel = n.velocity;
+            let dim = 0.35 + vel * 0.65;
+            let r = (0.08 + pr * 0.25) * dim;
+            let g = (0.45 + pr * 0.35) * dim;
+            let b = (0.95 + pr * 0.05) * dim;
 
-            // All notes same width (based on white key width), centered on key
-            let note_w = key_w;
-            let note_x = key_x;
             let inset = 2.0;
             note_instances.push(QuadInstance {
-                pos: [note_x + inset, visible_top],
-                size: [note_w - inset * 2.0, visible_bottom - visible_top],
+                pos: [key_x + inset, visible_top],
+                size: [key_w - inset * 2.0, visible_bottom - visible_top],
                 color: [r, g, b, 1.0],
             });
-        }
-
-        // Vertical key lane separator lines (very subtle white lines between white keys)
-        let note_clip_y_lines = keyboard_y - keyboard_height * 0.16;
-        for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
-            if keyboard::is_black_key(pitch) { continue; }
-            let (x, _w) = keyboard::key_rect(pitch, screen_w);
-            // Line at left edge of each white key
-            if x > 0.5 {
-                note_instances.push(QuadInstance {
-                    pos: [x, 0.0],
-                    size: [1.0, note_clip_y_lines],
-                    color: [1.0, 1.0, 1.0, 0.04],
-                });
-            }
         }
 
         // Upward-fading hazy glow at the front panel top (where notes disappear)
@@ -519,24 +628,29 @@ impl State {
             }
         }
 
-        // Smooth key press animation (exponential ease toward target)
-        let press_speed = 18.0_f32; // speed of press-down
-        let release_speed = 8.0_f32; // speed of release (slower for realism)
+        // Key press animation: instant press-down, fast linear release
+        let dt = wall_dt as f32;
         for i in 0..88 {
-            let target = if active_keys[i] { 1.0 } else { 0.0 };
-            let speed = if active_keys[i] { press_speed } else { release_speed };
-            self.key_press_state[i] += (target - self.key_press_state[i]) * (speed * wall_dt as f32).min(1.0);
+            if active_keys[i] {
+                self.key_press_state[i] = 1.0; // snap down instantly
+            } else {
+                // Linear release: fully up in ~60ms
+                self.key_press_state[i] = (self.key_press_state[i] - dt * 16.0).max(0.0);
+            }
         }
 
-        // Trigger audio for notes hitting the keyboard (only during normal playback, not scrolling)
+        // Trigger audio for notes hitting the keyboard
         let is_scrolling = self.drag_active || self.scroll_velocity.abs() > 1.0;
         for (i, n) in self.song.notes.iter().enumerate() {
             let is_active = t >= n.start_time && t < n.start_time + n.duration;
             if is_active && !self.triggered_notes[i] {
                 self.triggered_notes[i] = true;
                 #[cfg(target_arch = "wasm32")]
-                if !is_scrolling {
-                    if let Some(ref player) = self.audio_player {
+                if let Some(ref player) = self.audio_player {
+                    if is_scrolling {
+                        // Half volume, short duration to avoid sustain buildup during scroll
+                        let _ = player.play_note(n.pitch, n.velocity * 0.5, n.duration.min(0.15));
+                    } else {
                         let _ = player.play_note(n.pitch, n.velocity, n.duration);
                     }
                 }
@@ -580,13 +694,11 @@ impl State {
             let key_depth_px = keyboard_height * 0.95;
             let bk_depth_px = keyboard_height * 0.60;
 
-            // White keys first, then black keys (depth buffer handles ordering)
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 let (x, w) = keyboard::key_rect(pitch, screen_w);
                 let is_black = keyboard::is_black_key(pitch);
                 let press = self.key_press_state[pitch as usize];
 
-                // Blend colors smoothly using press value (not binary active flag)
                 let p = press;
                 if is_black {
                     keys_3d.push(KeyInstance3D {
@@ -596,12 +708,9 @@ impl State {
                         key_depth: bk_depth_px,
                         press,
                         is_black: 1.0,
-                        color: [
-                            0.05 + p * 0.07,
-                            0.05 + p * 0.07,
-                            0.07 + p * 0.08,
-                            1.0,
-                        ],
+                        light: 0.0,
+                        _pad_inst: 0.0,
+                        color: [0.05, 0.05, 0.07, 1.0],
                     });
                 } else {
                     keys_3d.push(KeyInstance3D {
@@ -611,10 +720,12 @@ impl State {
                         key_depth: key_depth_px,
                         press,
                         is_black: 0.0,
+                        light: 0.0,
+                        _pad_inst: 0.0,
                         color: [
-                            0.82 + p * 0.06,
-                            0.80 + p * 0.06,
-                            0.77 + p * 0.06,
+                            0.82 + p * 0.18,
+                            0.80 + p * 0.15,
+                            0.77 + p * 0.10,
                             1.0,
                         ],
                     });
@@ -639,11 +750,31 @@ impl State {
                 size: [screen_w, front_panel_h],
                 color: [0.06, 0.06, 0.07, 1.0],
             });
-            // Subtle highlight line at the very top edge of the front panel
+            // Neon glow at the top edge of the front panel
+            // Gradient layers above the core line, fading upward
+            let glow_top = keyboard_y - front_panel_h;
+            // Smooth glow: many thin layers to avoid visible banding
+            let glow_total_h = 144.0_f32;
+            let glow_steps = 24_u32;
+            let step_h = glow_total_h / glow_steps as f32;
+            for s in 0..glow_steps {
+                let frac = s as f32 / (glow_steps - 1) as f32; // 0 = top (far), 1 = bottom (near core)
+                let alpha = 0.02 + frac * frac * 0.35; // quadratic falloff
+                // Saturated blue at top → white at bottom (near core line)
+                let r = 0.15 + frac * 0.8;
+                let g = 0.4 + frac * 0.55;
+                let y = glow_top - glow_total_h + s as f32 * step_h;
+                kb_instances.push(QuadInstance {
+                    pos: [0.0, y],
+                    size: [screen_w, step_h + 1.0], // +1 overlap to prevent gaps
+                    color: [r.min(1.0), g.min(1.0), 1.0, alpha],
+                });
+            }
+            // Bright near-white core line
             kb_instances.push(QuadInstance {
-                pos: [0.0, keyboard_y - front_panel_h],
-                size: [screen_w, 1.0],
-                color: [0.12, 0.12, 0.14, 1.0],
+                pos: [0.0, glow_top],
+                size: [screen_w, 2.0],
+                color: [0.95, 0.97, 1.0, 1.0],
             });
             self.queue.write_buffer(
                 &self.keyboard_instance_buffer,
@@ -774,6 +905,18 @@ impl State {
             );
             self.keyboard_instance_count = kb_instances.len() as u32;
         }
+    }
+
+    /// Returns true if the scene has ongoing activity requiring another frame.
+    fn needs_animation(&self) -> bool {
+        if !self.paused { return true; }
+        if self.waiting_for_samples { return true; }
+        if self.drag_active { return true; }
+        if self.scroll_velocity.abs() > 0.5 { return true; }
+        if self.rewind_target.is_some() { return true; }
+        if !self.particle_system.particles.is_empty() { return true; }
+        // Keys still transitioning (not yet settled at 0 or 1)
+        self.key_press_state.iter().any(|&v| v > 0.002 && v < 0.998)
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -964,7 +1107,16 @@ impl ApplicationHandler<State> for App {
         event: WindowEvent,
     ) {
         let Some(state) = &mut self.state else { return };
-        if state.input(&event) { return; }
+
+        // Wake the render loop if external code (e.g. MIDI load) requested it
+        if REDRAW_FLAG.swap(false, Ordering::Relaxed) {
+            state.window.request_redraw();
+        }
+
+        if state.input(&event) {
+            state.window.request_redraw();
+            return;
+        }
 
         match event {
             WindowEvent::CloseRequested
@@ -979,9 +1131,9 @@ impl ApplicationHandler<State> for App {
             WindowEvent::Resized(physical_size) => {
                 state.surface_configured = true;
                 state.resize(physical_size);
+                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                state.window.request_redraw();
                 if !state.surface_configured { return; }
                 state.update();
                 match state.render() {
@@ -997,6 +1149,10 @@ impl ApplicationHandler<State> for App {
                         log::error!("Surface error: {e:?}");
                         event_loop.exit();
                     }
+                }
+                // Only request the next frame if there's ongoing activity
+                if state.needs_animation() {
+                    state.window.request_redraw();
                 }
             }
             _ => {}

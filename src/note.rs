@@ -15,6 +15,10 @@ pub struct Note {
 pub struct Song {
     pub notes: Vec<Note>,
     pub bpm: f32,
+    /// Time (seconds) of each measure boundary
+    pub measures: Vec<f32>,
+    /// Time (seconds) of each beat boundary
+    pub beats: Vec<f32>,
 }
 
 /// Convert MIDI note number (60 = C4) to pitch (0-87).
@@ -35,19 +39,33 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
     };
 
     // Build tempo map: (absolute_tick, microseconds_per_beat)
+    // Build time signature map: (absolute_tick, numerator, denominator_as_power_of_2)
     let mut tempo_map: Vec<(u64, u32)> = Vec::new();
+    let mut timesig_map: Vec<(u64, u8, u8)> = Vec::new();
+    let mut max_tick: u64 = 0;
     for track in &smf.tracks {
         let mut abs_tick: u64 = 0;
         for event in track {
             abs_tick += event.delta.as_int() as u64;
-            if let TrackEventKind::Meta(MetaMessage::Tempo(tempo)) = event.kind {
-                tempo_map.push((abs_tick, tempo.as_int()));
+            match event.kind {
+                TrackEventKind::Meta(MetaMessage::Tempo(tempo)) => {
+                    tempo_map.push((abs_tick, tempo.as_int()));
+                }
+                TrackEventKind::Meta(MetaMessage::TimeSignature(num, den, _, _)) => {
+                    timesig_map.push((abs_tick, num, den));
+                }
+                _ => {}
             }
         }
+        if abs_tick > max_tick { max_tick = abs_tick; }
     }
     tempo_map.sort_by_key(|&(tick, _)| tick);
     if tempo_map.is_empty() || tempo_map[0].0 != 0 {
         tempo_map.insert(0, (0, 500_000)); // default 120 BPM
+    }
+    timesig_map.sort_by_key(|&(tick, _, _)| tick);
+    if timesig_map.is_empty() || timesig_map[0].0 != 0 {
+        timesig_map.insert(0, (0, 4, 2)); // default 4/4
     }
 
     let bpm = 60_000_000.0 / tempo_map[0].1 as f32;
@@ -126,7 +144,46 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
     }
 
     notes.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
-    Ok(Song { notes, bpm })
+
+    // Compute measure and beat boundaries from time signature + tempo maps
+    let mut measures = Vec::new();
+    let mut beats = Vec::new();
+    let end_secs = ticks_to_secs(max_tick) as f32 + 4.0; // a bit past the last event
+    {
+        let mut tick: u64 = 0;
+        let mut ts_idx = 0;
+        let mut numerator: u32 = timesig_map[0].1 as u32;
+        let mut denom_exp: u32 = timesig_map[0].2 as u32;
+        // ticks per beat = ticks_per_quarter * (4 / denominator)
+        // denominator = 2^denom_exp, so ticks_per_beat = tpb * 4 / 2^denom_exp
+        let mut ticks_per_beat_val = (ticks_per_beat * 4.0) / (1u64 << denom_exp) as f64;
+        let mut beat_in_measure: u32 = 0;
+
+        while ticks_to_secs(tick) < end_secs as f64 {
+            // Check for time signature change at this tick
+            while ts_idx + 1 < timesig_map.len() && timesig_map[ts_idx + 1].0 <= tick {
+                ts_idx += 1;
+                numerator = timesig_map[ts_idx].1 as u32;
+                denom_exp = timesig_map[ts_idx].2 as u32;
+                ticks_per_beat_val = (ticks_per_beat * 4.0) / (1u64 << denom_exp) as f64;
+                beat_in_measure = 0;
+            }
+
+            let t = ticks_to_secs(tick) as f32;
+            if beat_in_measure == 0 {
+                measures.push(t);
+            }
+            beats.push(t);
+
+            beat_in_measure += 1;
+            if beat_in_measure >= numerator {
+                beat_in_measure = 0;
+            }
+            tick += ticks_per_beat_val as u64;
+        }
+    }
+
+    Ok(Song { notes, bpm, measures, beats })
 }
 
 /// Helper: push a melody note (MIDI number, start in eighth-note units).
@@ -151,7 +208,7 @@ fn bass(notes: &mut Vec<Note>, midi: u8, start_8th: f32, dur_8ths: f32, eighth: 
 
 /// Default demo: embedded MIDI file parsed at startup.
 pub fn default_song() -> Song {
-    let midi_data = include_bytes!("../coldplay-a_sky_full_of_stars.mid");
+    let midi_data = include_bytes!("../hans-zimmer-cornfield-chase-interstellar-soundtrack-21091-nonstop2k.com.mid");
     parse_midi(midi_data).unwrap_or_else(|_| demo_song())
 }
 
@@ -245,7 +302,20 @@ pub fn demo_song() -> Song {
         bass(&mut notes, root, b + 4.0, 2.0, eighth);
     }
 
-    Song { notes, bpm }
+    // Generate measure/beat lines for the demo song (4/4 time)
+    let mut measures = Vec::new();
+    let mut beats = Vec::new();
+    let total_eighths = 64.0;
+    let total_secs = total_eighths * eighth;
+    let mut t = 0.0;
+    let mut beat_count = 0;
+    while t <= total_secs + 2.0 {
+        if beat_count % 4 == 0 { measures.push(t); }
+        beats.push(t);
+        t += beat;
+        beat_count += 1;
+    }
+    Song { notes, bpm, measures, beats }
 }
 
 #[cfg(test)]

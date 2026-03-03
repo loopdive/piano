@@ -12,6 +12,8 @@ pub struct KeyInstance3D {
     pub key_depth: f32,
     pub press: f32,
     pub is_black: f32,
+    pub light: f32,      // illumination from nearby pressed keys (0.0 - 1.0+)
+    pub _pad_inst: f32,  // padding for alignment
     pub color: [f32; 4],
 }
 
@@ -144,23 +146,27 @@ impl KeyRenderer {
                         array_stride: std::mem::size_of::<KeyInstance3D>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
+                            // pos_x, key_width
                             wgpu::VertexAttribute {
                                 offset: 0,
                                 shader_location: 2,
                                 format: wgpu::VertexFormat::Float32x2,
                             },
+                            // key_height, key_depth
                             wgpu::VertexAttribute {
                                 offset: 8,
                                 shader_location: 3,
                                 format: wgpu::VertexFormat::Float32x2,
                             },
+                            // press, is_black, light, _pad
                             wgpu::VertexAttribute {
                                 offset: 16,
                                 shader_location: 4,
-                                format: wgpu::VertexFormat::Float32x2,
+                                format: wgpu::VertexFormat::Float32x4,
                             },
+                            // color
                             wgpu::VertexAttribute {
-                                offset: 24,
+                                offset: 32,
                                 shader_location: 5,
                                 format: wgpu::VertexFormat::Float32x4,
                             },

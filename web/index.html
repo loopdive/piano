@@ -1,229 +1,292 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-    <meta charset="utf-8">
+  <head>
+    <meta charset="utf-8" />
     <title>Piano Fall</title>
     <style>
-        body { margin: 0; background: #000; overflow: hidden; }
-        #piano-fall { width: 100vw; height: 100vh; position: relative; }
-        #piano-fall canvas { width: 100%; height: 100%; display: block; outline: none; }
-        #overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.85); display: flex; flex-direction: column;
-            justify-content: center; align-items: center; gap: 20px;
-            z-index: 10; cursor: pointer;
-        }
-        #overlay span { color: #4af; font-family: sans-serif; font-size: 24px; }
-        #midi-upload {
-            position: fixed; top: 10px; right: 10px; z-index: 20;
-            background: #222; border: 1px solid #4af; color: #4af;
-            font-family: sans-serif; font-size: 14px; padding: 8px 16px;
-            cursor: pointer; border-radius: 4px;
-        }
-        #midi-upload:hover { background: #333; }
-        #midi-input { display: none; }
-        #loading-status {
-            position: fixed; bottom: 10px; left: 10px; z-index: 20;
-            color: #666; font-family: sans-serif; font-size: 12px;
-        }
-        #key-labels {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            pointer-events: none; z-index: 5;
-        }
-        .key-label {
-            position: absolute; top: 50%;
-            transform: translate(-50%, -50%);
-            color: rgba(255,255,255,0.12);
-            font-family: sans-serif; font-size: 11px;
-            user-select: none; white-space: nowrap;
-        }
+      body {
+        margin: 0;
+        background: #000;
+        overflow: hidden;
+      }
+      #piano-fall {
+        width: 100vw;
+        height: 100vh;
+        position: relative;
+      }
+      #piano-fall canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+        outline: none;
+      }
+      #midi-upload {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        z-index: 20;
+        background: #222;
+        border: 1px solid #4af;
+        color: #4af;
+        font-family: sans-serif;
+        font-size: 14px;
+        padding: 8px 16px;
+        cursor: pointer;
+        border-radius: 4px;
+      }
+      #midi-upload:hover {
+        background: #333;
+      }
+      #midi-input {
+        display: none;
+      }
+      #loading-status {
+        position: fixed;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 20;
+        color: #4af;
+        font-family: sans-serif;
+        font-size: 14px;
+        text-align: center;
+      }
+      #key-labels {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 5;
+      }
+      .key-label {
+        position: absolute;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        color: rgba(255, 255, 255, 0.12);
+        font-family: sans-serif;
+        font-size: 11px;
+        user-select: none;
+        white-space: nowrap;
+      }
     </style>
-</head>
-<body>
-    <div id="overlay">
-        <span>Click to Start</span>
-        <span style="font-size: 14px; color: #888;">or drop a .mid file onto the page</span>
-    </div>
+  </head>
+  <body>
     <div id="piano-fall"><canvas id="canvas"></canvas></div>
     <div id="key-labels"></div>
     <button id="midi-upload">Load MIDI</button>
-    <input type="file" id="midi-input" accept=".mid,.midi">
+    <input type="file" id="midi-input" accept=".mid,.midi" />
     <div id="loading-status"></div>
 
     <script>
-    // Piano Sampler — loads real piano samples from FluidR3 GM soundfont
-    (function() {
-        const NOTE_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
-        const CDN = 'https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM/acoustic_grand_piano-mp3';
+      // Piano Sampler — loads real piano samples from FluidR3 GM soundfont (MIT license)
+      (function () {
+        const NOTE_NAMES = [
+          "C",
+          "Db",
+          "D",
+          "Eb",
+          "E",
+          "F",
+          "Gb",
+          "G",
+          "Ab",
+          "A",
+          "Bb",
+          "B",
+        ];
+        const CDN = "samples"; // local samples directory
         let ctx = null;
         const buffers = new Map();
         let loadedCount = 0;
-        const statusEl = document.getElementById('loading-status');
+        let samplesReady = false;
+        const statusEl = document.getElementById("loading-status");
+
+        window._areSamplesReady = function () {
+          return samplesReady;
+        };
 
         function midiToName(midi) {
-            const octave = Math.floor(midi / 12) - 1;
-            const note = NOTE_NAMES[midi % 12];
-            return note + octave;
+          const octave = Math.floor(midi / 12) - 1;
+          const note = NOTE_NAMES[midi % 12];
+          return note + octave;
         }
 
         async function loadNote(midi) {
-            try {
-                const name = midiToName(midi);
-                const resp = await fetch(CDN + '/' + name + '.mp3');
-                const arrayBuf = await resp.arrayBuffer();
-                const audioBuf = await ctx.decodeAudioData(arrayBuf);
-                buffers.set(midi, audioBuf);
-                loadedCount++;
-                if (statusEl) statusEl.textContent = 'Piano samples: ' + loadedCount + '/88';
-            } catch(e) {
-                console.warn('Failed to load sample for MIDI ' + midi, e);
-            }
+          try {
+            const name = midiToName(midi);
+            const resp = await fetch(CDN + "/" + name + ".mp3");
+            const arrayBuf = await resp.arrayBuffer();
+            const audioBuf = await ctx.decodeAudioData(arrayBuf);
+            buffers.set(midi, audioBuf);
+            loadedCount++;
+            if (statusEl)
+              statusEl.textContent = "Piano samples: " + loadedCount + "/88";
+          } catch (e) {
+            console.warn("Failed to load sample for MIDI " + midi, e);
+          }
         }
 
         function preload() {
-            if (statusEl) statusEl.textContent = 'Loading piano samples...';
-            // Load all 88 piano keys in parallel (MIDI 21=A0 to 108=C8)
-            const promises = [];
-            for (let i = 21; i <= 108; i++) {
-                promises.push(loadNote(i));
-            }
-            Promise.all(promises).then(() => {
-                if (statusEl) statusEl.textContent = '';
-                console.log('All piano samples loaded');
-            });
+          if (statusEl) statusEl.textContent = "Loading piano samples...";
+          // Load all 88 piano keys in parallel (MIDI 21=A0 to 108=C8)
+          const promises = [];
+          for (let i = 21; i <= 108; i++) {
+            promises.push(loadNote(i));
+          }
+          Promise.all(promises).then(() => {
+            samplesReady = true;
+            if (statusEl) statusEl.textContent = "";
+            console.log("All piano samples loaded");
+          });
         }
 
         // Synth fallback for when samples aren't loaded yet
         function synthFallback(midiNote, velocity, duration) {
-            const freq = 440 * Math.pow(2, (midiNote - 69) / 12);
-            const vol = Math.min(1, velocity) * 0.3;
-            const now = ctx.currentTime;
-            const decay = Math.max(0.3, Math.min(duration, 2.0));
+          const freq = 440 * Math.pow(2, (midiNote - 69) / 12);
+          const vol = Math.min(1, velocity) * 0.3;
+          const now = ctx.currentTime;
+          const decay = Math.max(0.3, Math.min(duration, 2.0));
 
-            for (const [h, a] of [[1, 1], [2, 0.4], [3, 0.15]]) {
-                if (freq * h > 15000) continue;
-                const osc = ctx.createOscillator();
-                const g = ctx.createGain();
-                osc.type = 'triangle';
-                osc.frequency.value = freq * h;
-                g.gain.setValueAtTime(0, now);
-                g.gain.linearRampToValueAtTime(vol * a, now + 0.005);
-                g.gain.exponentialRampToValueAtTime(0.001, now + decay);
-                osc.connect(g); g.connect(ctx.destination);
-                osc.start(); osc.stop(now + decay + 0.05);
-            }
+          for (const [h, a] of [
+            [1, 1],
+            [2, 0.4],
+            [3, 0.15],
+          ]) {
+            if (freq * h > 15000) continue;
+            const osc = ctx.createOscillator();
+            const g = ctx.createGain();
+            osc.type = "triangle";
+            osc.frequency.value = freq * h;
+            g.gain.setValueAtTime(0, now);
+            g.gain.linearRampToValueAtTime(vol * a, now + 0.005);
+            g.gain.exponentialRampToValueAtTime(0.001, now + decay);
+            osc.connect(g);
+            g.connect(ctx.destination);
+            osc.start();
+            osc.stop(now + decay + 0.05);
+          }
         }
 
         // Called from Rust via wasm-bindgen extern
-        window._pianoPlay = function(midiNote, velocity, duration) {
-            if (!ctx) return;
-            if (ctx.state !== 'running') ctx.resume();
+        window._pianoPlay = function (midiNote, velocity, duration) {
+          if (!ctx) return;
+          if (ctx.state !== "running") ctx.resume();
 
-            const buf = buffers.get(midiNote);
-            if (!buf) {
-                // Synth fallback while samples are loading
-                synthFallback(midiNote, velocity, duration);
-                return;
+          const buf = buffers.get(midiNote);
+          if (!buf) {
+            // Synth fallback while samples are loading
+            synthFallback(midiNote, velocity, duration);
+            return;
+          }
+
+          try {
+            const source = ctx.createBufferSource();
+            const gain = ctx.createGain();
+            source.buffer = buf;
+
+            const vol = Math.min(1, velocity) * 0.8;
+            const now = ctx.currentTime;
+
+            gain.gain.setValueAtTime(vol, now);
+
+            source.connect(gain);
+            gain.connect(ctx.destination);
+            source.start();
+
+            // Schedule fade-out and stop AFTER start()
+            if (duration > 0 && duration < buf.duration) {
+              const fadeStart = now + duration;
+              gain.gain.setValueAtTime(vol, fadeStart);
+              gain.gain.exponentialRampToValueAtTime(0.001, fadeStart + 0.15);
+              source.stop(fadeStart + 0.2);
             }
-
-            try {
-                const source = ctx.createBufferSource();
-                const gain = ctx.createGain();
-                source.buffer = buf;
-
-                const vol = Math.min(1, velocity) * 0.8;
-                const now = ctx.currentTime;
-
-                gain.gain.setValueAtTime(vol, now);
-
-                source.connect(gain);
-                gain.connect(ctx.destination);
-                source.start();
-
-                // Schedule fade-out and stop AFTER start()
-                if (duration > 0 && duration < buf.duration) {
-                    const fadeStart = now + duration;
-                    gain.gain.setValueAtTime(vol, fadeStart);
-                    gain.gain.exponentialRampToValueAtTime(0.001, fadeStart + 0.15);
-                    source.stop(fadeStart + 0.2);
-                }
-            } catch(e) {
-                console.warn('Piano play error:', e);
-            }
+          } catch (e) {
+            console.warn("Piano play error:", e);
+          }
         };
 
-        window._pianoResume = function() {
-            if (!ctx) {
-                ctx = new AudioContext();
-                preload();
-            }
-            if (ctx.state !== 'running') ctx.resume();
+        window._pianoResume = function () {
+          if (!ctx) {
+            ctx = new AudioContext();
+            preload();
+          }
+          if (ctx.state !== "running") ctx.resume();
         };
 
         // Start loading on first user interaction
-        document.addEventListener('click', function init() {
+        document.addEventListener(
+          "click",
+          function init() {
             window._pianoResume();
-            document.removeEventListener('click', init);
-        }, { once: true });
-    })();
+            document.removeEventListener("click", init);
+          },
+          { once: true },
+        );
+      })();
     </script>
 
     <script>
-    // Key lane labels — positioned at each C note
-    (function() {
-        const container = document.getElementById('key-labels');
+      // Key lane labels — positioned at each C note
+      (function () {
+        const container = document.getElementById("key-labels");
         const WHITE_COUNT = 49; // C1–B7 = 7 octaves × 7 white keys
         const keyW = 100 / WHITE_COUNT; // percent per white key
         // C notes and their white-key index within the visible range
         // C1=0, C2=7, C3=14, C4=21 (middle C), C5=28, C6=35, C7=42
         const labels = [
-            [0,  'C1'], [7,  'C2'], [14, 'C3'], [21, "C4"],
-            [28, 'C5'], [35, 'C6'], [42, 'C7'],
+          [0, "C1"],
+          [7, "C2"],
+          [14, "C3"],
+          [21, "C4"],
+          [28, "C5"],
+          [35, "C6"],
+          [42, "C7"],
         ];
         for (const [idx, name] of labels) {
-            const el = document.createElement('div');
-            el.className = 'key-label';
-            el.textContent = name;
-            el.style.left = (idx + 0.5) * keyW + '%';
-            container.appendChild(el);
+          const el = document.createElement("div");
+          el.className = "key-label";
+          el.textContent = name;
+          el.style.left = (idx + 0.5) * keyW + "%";
+          container.appendChild(el);
         }
-    })();
+      })();
     </script>
 
     <script type="module">
-        document.getElementById('overlay').addEventListener('click', function() {
-            this.style.display = 'none';
-            window._pianoResume(); // start audio in user gesture context
+      // MIDI file loading via button
+      document.getElementById("midi-upload").addEventListener("click", (e) => {
+        e.stopPropagation();
+        document.getElementById("midi-input").click();
+      });
+
+      document
+        .getElementById("midi-input")
+        .addEventListener("change", async (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          window._pianoResume();
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          if (window._loadMidi) window._loadMidi(bytes);
         });
 
-        // MIDI file loading via button
-        document.getElementById('midi-upload').addEventListener('click', (e) => {
-            e.stopPropagation();
-            document.getElementById('midi-input').click();
-        });
+      // Drag and drop MIDI files
+      document.addEventListener("dragover", (e) => {
+        e.preventDefault();
+      });
+      document.addEventListener("drop", async (e) => {
+        e.preventDefault();
+        const file = e.dataTransfer.files[0];
+        if (!file || !file.name.match(/\.midi?$/i)) return;
+        window._pianoResume();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (window._loadMidi) window._loadMidi(bytes);
+      });
 
-        document.getElementById('midi-input').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const bytes = new Uint8Array(await file.arrayBuffer());
-            if (window._loadMidi) window._loadMidi(bytes);
-            document.getElementById('overlay').style.display = 'none';
-        });
-
-        // Drag and drop MIDI files
-        document.addEventListener('dragover', (e) => { e.preventDefault(); });
-        document.addEventListener('drop', async (e) => {
-            e.preventDefault();
-            const file = e.dataTransfer.files[0];
-            if (!file || !file.name.match(/\.midi?$/i)) return;
-            const bytes = new Uint8Array(await file.arrayBuffer());
-            if (window._loadMidi) window._loadMidi(bytes);
-            document.getElementById('overlay').style.display = 'none';
-        });
-
-        import init, { load_midi } from './pkg/piano_fall.js';
-        window._loadMidi = load_midi;
-        await init();
+      import init, { load_midi } from "./pkg/piano_fall.js";
+      window._loadMidi = load_midi;
+      await init();
     </script>
-</body>
+  </body>
 </html>
