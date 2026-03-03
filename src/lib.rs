@@ -1,3 +1,6 @@
+pub mod keyboard;
+pub mod note;
+
 use std::iter;
 use winit::{
     event::*,
