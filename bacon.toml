@@ -1,0 +1,23 @@
+# bacon.toml — watch-mode compilation jobs for piano-fall
+# Run with: bacon <job>   (e.g. bacon wasm, bacon check, bacon test)
+
+[jobs.check]
+command = ["cargo", "check", "--color", "always"]
+need_stdout = false
+
+[jobs.test]
+command = ["cargo", "test", "--color", "always"]
+need_stdout = true
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--color", "always", "--", "-W", "clippy::pedantic"]
+need_stdout = false
+
+[jobs.wasm]
+command = ["wasm-pack", "build", "--target", "web", "--out-dir", "web/pkg"]
+need_stdout = true
+# wasm-pack doesn't support --color, watch all .rs/.wgsl/.toml files
+watch = ["src", "Cargo.toml"]
+
+[default]
+job = "wasm"

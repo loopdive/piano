@@ -306,18 +306,18 @@
       // Key lane labels — positioned at each C note
       (function () {
         const container = document.getElementById("key-labels");
-        const WHITE_COUNT = 49; // C1–B7 = 7 octaves × 7 white keys
+        const WHITE_COUNT = 52; // Full 88-key piano: A0–C8
         const keyW = 100 / WHITE_COUNT; // percent per white key
         // C notes and their white-key index within the visible range
-        // C1=0, C2=7, C3=14, C4=21 (middle C), C5=28, C6=35, C7=42
+        // A0=0, B0=1, C1=2, C2=9, C3=16, C4=23 (middle C), C5=30, C6=37, C7=44, C8=51
         const labels = [
-          [0, "C1"],
-          [7, "C2"],
-          [14, "C3"],
-          [21, "C4"],
-          [28, "C5"],
-          [35, "C6"],
-          [42, "C7"],
+          [2, "C1"],
+          [9, "C2"],
+          [16, "C3"],
+          [23, "C4"],
+          [30, "C5"],
+          [37, "C6"],
+          [44, "C7"],
         ];
         for (const [idx, name] of labels) {
           const el = document.createElement("div");

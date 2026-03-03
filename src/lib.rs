@@ -185,6 +185,11 @@ struct State {
     pinch_base_zoom: f32,
     // Modifier key state (for Ctrl+scroll zoom)
     modifiers: winit::event::Modifiers,
+    // Scroll axis detection (same threshold logic as drag)
+    scroll_axis: Option<DragAxis>,
+    scroll_accum_x: f64,
+    scroll_accum_y: f64,
+    last_scroll_time: f64,
 }
 
 impl State {
@@ -297,7 +302,7 @@ impl State {
         let song = note::default_song();
         #[cfg(target_arch = "wasm32")]
         set_song_title(&song.title);
-        let h_offset = Self::auto_center_offset(&song, size.width as f32);
+        let (keyboard_zoom, h_offset) = Self::auto_fit_song(&song, size.width as f32);
         let triggered_notes = vec![false; song.notes.len()];
 
         #[cfg(target_arch = "wasm32")]
@@ -347,11 +352,15 @@ impl State {
             scroll_velocity: 0.0,
             was_paused_before_drag: false,
             theme: default_theme(),
-            keyboard_zoom: 1.0,
+            keyboard_zoom,
             touches: std::collections::HashMap::new(),
             pinch_base_dist: 0.0,
             pinch_base_zoom: 1.0,
             modifiers: winit::event::Modifiers::default(),
+            scroll_axis: None,
+            scroll_accum_x: 0.0,
+            scroll_accum_y: 0.0,
+            last_scroll_time: 0.0,
         }
     }
 
@@ -369,19 +378,28 @@ impl State {
         }
     }
 
-    /// Compute the horizontal offset to center the song's note range on screen.
-    fn auto_center_offset(song: &note::Song, screen_w: f32) -> f32 {
-        if song.notes.is_empty() { return 0.0; }
+    /// Compute zoom and offset to fit the song's note range to the screen width.
+    /// Returns (zoom, h_offset).
+    fn auto_fit_song(song: &note::Song, screen_w: f32) -> (f32, f32) {
+        if song.notes.is_empty() { return (1.0, 0.0); }
         let min_pitch = song.notes.iter().map(|n| n.pitch).min().unwrap();
         let max_pitch = song.notes.iter().map(|n| n.pitch).max().unwrap();
-        // Only center if notes don't span the full keyboard
-        if min_pitch <= keyboard::VISIBLE_START + 5 && max_pitch >= keyboard::VISIBLE_END - 5 {
-            return 0.0;
-        }
-        let (x_min, _) = keyboard::key_rect(min_pitch, screen_w);
-        let (x_max, w_max) = keyboard::key_rect(max_pitch, screen_w);
-        let note_center = (x_min + x_max + w_max) / 2.0;
-        screen_w / 2.0 - note_center
+        // Use unit width (1.0) to get fractional positions, then compute zoom
+        let (x_min, _) = keyboard::key_rect(min_pitch, 1.0);
+        let (x_max, w_max) = keyboard::key_rect(max_pitch, 1.0);
+        let note_span = x_max + w_max - x_min;
+        // Add some padding (10% on each side)
+        let padded_span = note_span * 1.2;
+        // zoom = how much wider the virtual keyboard needs to be so that
+        // the note span (as a fraction of the virtual width) fills the screen
+        let zoom = if padded_span > 0.001 { (1.0 / padded_span).clamp(1.0, 5.0) } else { 1.0 };
+        // Now compute centering offset using the zoomed width
+        let zoomed_w = screen_w * zoom;
+        let (zx_min, _) = keyboard::key_rect(min_pitch, zoomed_w);
+        let (zx_max, zw_max) = keyboard::key_rect(max_pitch, zoomed_w);
+        let note_center = (zx_min + zx_max + zw_max) / 2.0;
+        let h_offset = screen_w / 2.0 - note_center;
+        (zoom, h_offset)
     }
 
     fn clamp_h_offset(&self, offset: f32) -> f32 {
@@ -573,15 +591,15 @@ impl State {
                 self.h_offset = self.clamp_h_offset(self.h_offset);
                 return true;
             }
-            // Mouse wheel: Ctrl held = zoom, otherwise scroll time
+            // Mouse wheel: Ctrl held = zoom, otherwise axis-locked scroll
             WindowEvent::MouseWheel { delta, .. } => {
-                let pixels = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y as f64 * 60.0,
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y,
+                let (pixels_x, pixels_y, is_line) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (*x as f64 * 60.0, *y as f64 * 60.0, true),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y, false),
                 };
                 if self.modifiers.state().control_key() {
                     // Ctrl+scroll: zoom in/out centered on cursor
-                    let zoom_delta = pixels as f32 / 500.0;
+                    let zoom_delta = pixels_y as f32 / 500.0;
                     let old_zoom = self.keyboard_zoom;
                     self.keyboard_zoom = (self.keyboard_zoom * (1.0 + zoom_delta)).clamp(1.0, 5.0);
                     let anchor_x = self.cursor_x as f32;
@@ -589,14 +607,49 @@ impl State {
                     self.h_offset = self.clamp_h_offset(self.h_offset);
                     return true;
                 }
-                // Positive pixels = scroll up = rewind (go back in time)
-                self.current_time -= pixels / 400.0;
-                self.current_time = self.current_time.max(0.0);
-                if pixels > 0.0 {
-                    // Rewinding — reset triggers for future notes
-                    let ct = self.current_time as f32;
-                    for (i, n) in self.song.notes.iter().enumerate() {
-                        if n.start_time > ct { self.triggered_notes[i] = false; }
+                // Discrete scroll wheel: no axis lock needed, act immediately
+                if is_line {
+                    if pixels_x.abs() > pixels_y.abs() {
+                        self.h_offset += pixels_x as f32;
+                        self.h_offset = self.clamp_h_offset(self.h_offset);
+                    } else {
+                        self.current_time -= pixels_y / 400.0;
+                        self.current_time = self.current_time.max(0.0);
+                    }
+                    return true;
+                }
+                self.last_scroll_time = self.last_wall_time;
+                // Accumulate scroll deltas for axis detection
+                self.scroll_accum_x += pixels_x;
+                self.scroll_accum_y += pixels_y;
+                if self.scroll_axis.is_none() {
+                    let ax = self.scroll_accum_x.abs();
+                    let ay = self.scroll_accum_y.abs();
+                    let threshold = 8.0;
+                    if ax > threshold || ay > threshold {
+                        self.scroll_axis = Some(if ax > ay {
+                            DragAxis::Horizontal
+                        } else {
+                            DragAxis::Vertical
+                        });
+                    } else {
+                        return true; // still accumulating, don't act yet
+                    }
+                }
+                match self.scroll_axis {
+                    Some(DragAxis::Horizontal) => {
+                        self.h_offset += pixels_x as f32;
+                        self.h_offset = self.clamp_h_offset(self.h_offset);
+                    }
+                    Some(DragAxis::Vertical) | None => {
+                        self.current_time -= pixels_y / 400.0;
+                        self.current_time = self.current_time.max(0.0);
+                        if pixels_y > 0.0 {
+                            let ct = self.current_time as f32;
+                            for (i, n) in self.song.notes.iter().enumerate() {
+                                if n.start_time > ct { self.triggered_notes[i] = false; }
+                            }
+                        }
                     }
                 }
                 return true;
@@ -652,7 +705,9 @@ impl State {
                     log::info!("Loaded MIDI: {} notes, {:.0} BPM, title={}", song.notes.len(), song.bpm, song.title);
                     #[cfg(target_arch = "wasm32")]
                     set_song_title(&song.title);
-                    self.h_offset = Self::auto_center_offset(&song, self.size.width as f32 * self.keyboard_zoom);
+                    let (zoom, offset) = Self::auto_fit_song(&song, self.size.width as f32);
+                    self.keyboard_zoom = zoom;
+                    self.h_offset = offset;
                     self.h_velocity = 0.0;
                     self.triggered_notes = vec![false; song.notes.len()];
                     self.song = song;
@@ -679,6 +734,13 @@ impl State {
         }
         let wall_dt = if self.last_wall_time > 0.0 { wall_now - self.last_wall_time } else { 0.0 };
         self.last_wall_time = wall_now;
+
+        // Reset scroll axis lock after 150ms of no scroll events
+        if self.scroll_axis.is_some() && wall_now - self.last_scroll_time > 0.15 {
+            self.scroll_axis = None;
+            self.scroll_accum_x = 0.0;
+            self.scroll_accum_y = 0.0;
+        }
 
         let scroll_speed = 400.0_f64;
 
@@ -798,7 +860,7 @@ impl State {
         let zoomed_width = screen_w * self.keyboard_zoom;
         let bottom_margin = screen_h * 0.03;
         // Derive keyboard height from white key width to maintain aspect ratio
-        let white_key_width = zoomed_width / 49.0;
+        let white_key_width = zoomed_width / 52.0;
         let keyboard_height = white_key_width * 6.0;
         let keyboard_y = screen_h - keyboard_height - bottom_margin;
         let scroll_speed_f = scroll_speed as f32 * self.keyboard_zoom;
@@ -1425,7 +1487,7 @@ impl State {
         if self.use_3d_keys && !self.key_instances_3d.is_empty() {
             let screen_h = self.size.height as f32;
             let bottom_margin = screen_h * 0.03;
-            let white_key_width = self.size.width as f32 * self.keyboard_zoom / 49.0;
+            let white_key_width = self.size.width as f32 * self.keyboard_zoom / 52.0;
             let keyboard_height = white_key_width * 6.0;
             let keyboard_y = screen_h - keyboard_height - bottom_margin;
             let max_depth = keyboard_height * 0.95;

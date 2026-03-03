@@ -1,11 +1,11 @@
 /// Piano keyboard layout calculations.
 /// Pitch 0 = A0, Pitch 87 = C8.
-/// Visible range: 7 octaves C1–B7 (pitches 3–86).
+/// Full 88-key range: A0–C8 (pitches 0–87).
 
-/// First visible pitch (C1)
-pub const VISIBLE_START: u8 = 3;
-/// Last visible pitch (B7)
-pub const VISIBLE_END: u8 = 86;
+/// First visible pitch (A0)
+pub const VISIBLE_START: u8 = 0;
+/// Last visible pitch (C8)
+pub const VISIBLE_END: u8 = 87;
 
 /// Returns the pitch class (0=C, 1=C#, ..., 11=B) for a given pitch.
 pub fn pitch_class(pitch: u8) -> u8 {
@@ -79,34 +79,33 @@ mod tests {
 
     #[test]
     fn test_visible_white_key_count() {
-        // 7 octaves (C1-B7) = 7 * 7 = 49 white keys
-        assert_eq!(visible_white_count(), 49);
+        // Full 88-key piano: A0–C8 = 52 white keys
+        assert_eq!(visible_white_count(), 52);
     }
 
     #[test]
     fn test_visible_range() {
-        assert!(!is_visible(0));  // A0 - below range
-        assert!(!is_visible(2));  // B0 - below range
-        assert!(is_visible(3));   // C1 - start
-        assert!(is_visible(86));  // B7 - end
-        assert!(!is_visible(87)); // C8 - above range
+        assert!(is_visible(0));   // A0 - start
+        assert!(is_visible(3));   // C1
+        assert!(is_visible(86));  // B7
+        assert!(is_visible(87));  // C8 - end
     }
 
     #[test]
     fn test_key_rect_first_visible() {
-        // C1 = pitch 3, first visible white key
-        let (x, _w) = key_rect(3, 980.0);
+        // A0 = pitch 0, first visible white key
+        let (x, _w) = key_rect(0, 1040.0);
         assert!((x - 0.0).abs() < 0.01);
-        let white_w = 980.0 / 49.0;
+        let white_w = 1040.0 / 52.0;
         assert!((_w - white_w).abs() < 0.01);
     }
 
     #[test]
     fn test_key_rect_black_key() {
-        // C#1 = pitch 4, first visible black key
-        let white_w = 980.0 / 49.0;
+        // A#0 = pitch 1, first visible black key
+        let white_w = 1040.0 / 52.0;
         let black_w = white_w * 0.6;
-        let (x, w) = key_rect(4, 980.0);
+        let (x, w) = key_rect(1, 1040.0);
         let expected_x = 1.0 * white_w - black_w / 2.0;
         assert!((x - expected_x).abs() < 0.01);
         assert!((w - black_w).abs() < 0.01);
