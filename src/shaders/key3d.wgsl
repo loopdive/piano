@@ -43,12 +43,12 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
     var p = v.position * vec3<f32>(key_w, key_h, key_d);
     var n = v.normal;
 
-    // Press: rotate around back edge (z = key_d) — real piano key pivot
-    let angle = press * -0.06; // ~3.4 degrees downward at full press
+    // Press: rotate around top edge (z = 0, where notes arrive).
+    // The viewer-facing part (z = key_d, bottom of keyboard area) dips down.
+    let angle = press * 0.06; // ~3.4 degrees — bottom edge dips
     let cos_a = cos(angle);
     let sin_a = sin(angle);
-    let dz = p.z - key_d;
-    p = vec3<f32>(p.x, p.y * cos_a - dz * sin_a, p.y * sin_a + dz * cos_a + key_d);
+    p = vec3<f32>(p.x, p.y * cos_a - p.z * sin_a, p.y * sin_a + p.z * cos_a);
     n = vec3<f32>(n.x, n.y * cos_a - n.z * sin_a, n.y * sin_a + n.z * cos_a);
 
     // Translate to world X position
