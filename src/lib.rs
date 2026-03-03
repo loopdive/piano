@@ -23,6 +23,7 @@ struct State<'a> {
     size: winit::dpi::PhysicalSize<u32>,
     window: &'a Window,
     quad_renderer: renderer::quad::QuadRenderer,
+    bloom: renderer::bloom::BloomRenderer,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
     #[allow(dead_code)] // used only on wasm32
@@ -85,7 +86,18 @@ impl<'a> State<'a> {
             view_formats: vec![],
         };
 
-        let quad_renderer = renderer::quad::QuadRenderer::new(&device, surface_format);
+        // QuadRenderer targets the offscreen texture format (Rgba8Unorm), not the surface
+        let quad_renderer = renderer::quad::QuadRenderer::new(
+            &device,
+            renderer::bloom::BloomRenderer::offscreen_format(),
+        );
+
+        let bloom = renderer::bloom::BloomRenderer::new(
+            &device,
+            size.width,
+            size.height,
+            surface_format,
+        );
 
         let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Keyboard Instances"),
@@ -106,7 +118,7 @@ impl<'a> State<'a> {
 
         Self {
             surface, device, queue, config, size, window,
-            quad_renderer, keyboard_instance_buffer, keyboard_instance_count,
+            quad_renderer, bloom, keyboard_instance_buffer, keyboard_instance_count,
             start_time, current_time: 0.0, song, note_instance_buffer,
             note_instance_count: 0,
         }
@@ -120,6 +132,8 @@ impl<'a> State<'a> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.bloom
+                .resize(&self.device, new_size.width, new_size.height);
         }
     }
 
@@ -243,7 +257,9 @@ impl<'a> State<'a> {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let screen_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.quad_renderer.update_globals(
             &self.queue,
@@ -252,13 +268,17 @@ impl<'a> State<'a> {
         );
 
         let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") },
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            },
         );
+
+        // Pass 1: Scene -> offscreen texture
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Scene Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: self.bloom.scene_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -271,11 +291,29 @@ impl<'a> State<'a> {
             });
             // Draw notes first (behind keyboard)
             if self.note_instance_count > 0 {
-                self.quad_renderer.draw(&mut render_pass, &self.note_instance_buffer, self.note_instance_count);
+                self.quad_renderer.draw(
+                    &mut pass,
+                    &self.note_instance_buffer,
+                    self.note_instance_count,
+                );
             }
             // Draw keyboard on top
-            self.quad_renderer.draw(&mut render_pass, &self.keyboard_instance_buffer, self.keyboard_instance_count);
+            self.quad_renderer.draw(
+                &mut pass,
+                &self.keyboard_instance_buffer,
+                self.keyboard_instance_count,
+            );
         }
+
+        // Pass 2: Bright extract
+        self.bloom.extract_pass(&mut encoder);
+        // Pass 3: Horizontal blur
+        self.bloom.blur_h_pass(&mut encoder);
+        // Pass 4: Vertical blur
+        self.bloom.blur_v_pass(&mut encoder);
+        // Pass 5: Composite -> swapchain
+        self.bloom.composite_pass(&mut encoder, &screen_view);
+
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
         Ok(())
