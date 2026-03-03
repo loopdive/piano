@@ -20,6 +20,12 @@ use winit::{
 use renderer::keys::KeyInstance3D;
 use renderer::quad::QuadInstance;
 
+#[derive(Clone, Copy, PartialEq)]
+enum DragAxis {
+    Horizontal,
+    Vertical,
+}
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -91,10 +97,18 @@ struct State {
     audio_unlocked: bool,
     waiting_for_samples: bool,
     rewind_target: Option<f64>,
-    // Drag-to-scrub state
+    // Horizontal scroll
+    h_offset: f32,
+    h_velocity: f64,
+    // Drag state
+    cursor_x: f64,
     cursor_y: f64,
     drag_active: bool,
+    drag_start_x: f64,
+    drag_start_y: f64,
+    drag_prev_x: f64,
     drag_prev_y: f64,
+    drag_axis: Option<DragAxis>,
     scroll_velocity: f64,
     was_paused_before_drag: bool,
 }
@@ -200,6 +214,7 @@ impl State {
         let song = note::default_song();
         #[cfg(target_arch = "wasm32")]
         set_song_title(&song.title);
+        let h_offset = Self::auto_center_offset(&song, size.width as f32);
         let triggered_notes = vec![false; song.notes.len()];
 
         #[cfg(target_arch = "wasm32")]
@@ -228,9 +243,16 @@ impl State {
             audio_unlocked: false,
             waiting_for_samples: false,
             rewind_target: None,
+            h_offset,
+            h_velocity: 0.0,
+            cursor_x: 0.0,
             cursor_y: 0.0,
             drag_active: false,
+            drag_start_x: 0.0,
+            drag_start_y: 0.0,
+            drag_prev_x: 0.0,
             drag_prev_y: 0.0,
+            drag_axis: None,
             scroll_velocity: 0.0,
             was_paused_before_drag: false,
         }
@@ -248,6 +270,26 @@ impl State {
         if pw != self.size.width || ph != self.size.height {
             self.resize(winit::dpi::PhysicalSize::new(pw, ph));
         }
+    }
+
+    /// Compute the horizontal offset to center the song's note range on screen.
+    fn auto_center_offset(song: &note::Song, screen_w: f32) -> f32 {
+        if song.notes.is_empty() { return 0.0; }
+        let min_pitch = song.notes.iter().map(|n| n.pitch).min().unwrap();
+        let max_pitch = song.notes.iter().map(|n| n.pitch).max().unwrap();
+        // Only center if notes don't span the full keyboard
+        if min_pitch <= keyboard::VISIBLE_START + 5 && max_pitch >= keyboard::VISIBLE_END - 5 {
+            return 0.0;
+        }
+        let (x_min, _) = keyboard::key_rect(min_pitch, screen_w);
+        let (x_max, w_max) = keyboard::key_rect(max_pitch, screen_w);
+        let note_center = (x_min + x_max + w_max) / 2.0;
+        screen_w / 2.0 - note_center
+    }
+
+    fn clamp_h_offset(&self, offset: f32) -> f32 {
+        let screen_w = self.size.width as f32;
+        offset.clamp(-screen_w * 0.8, screen_w * 0.8)
     }
 
     #[allow(unused_variables)]
@@ -293,6 +335,7 @@ impl State {
         match event {
             // Track cursor position for mouse drag
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_x = position.x;
                 self.cursor_y = position.y;
                 return self.drag_active;
             }
@@ -310,12 +353,16 @@ impl State {
                             if let Some(ref player) = self.audio_player {
                                 let _ = player.resume();
                             }
-                            // Stay paused until samples are loaded
                             self.waiting_for_samples = true;
                         }
                         self.drag_active = true;
+                        self.drag_start_x = self.cursor_x;
+                        self.drag_start_y = self.cursor_y;
+                        self.drag_prev_x = self.cursor_x;
                         self.drag_prev_y = self.cursor_y;
+                        self.drag_axis = None;
                         self.scroll_velocity = 0.0;
+                        self.h_velocity = 0.0;
                         self.was_paused_before_drag = self.paused;
                         self.rewind_target = None;
                         return true;
@@ -338,15 +385,22 @@ impl State {
                             }
                             self.waiting_for_samples = true;
                         }
+                        self.cursor_x = touch.location.x;
                         self.cursor_y = touch.location.y;
                         self.drag_active = true;
+                        self.drag_start_x = self.cursor_x;
+                        self.drag_start_y = self.cursor_y;
+                        self.drag_prev_x = self.cursor_x;
                         self.drag_prev_y = self.cursor_y;
+                        self.drag_axis = None;
                         self.scroll_velocity = 0.0;
+                        self.h_velocity = 0.0;
                         self.was_paused_before_drag = self.paused;
                         self.rewind_target = None;
                         return true;
                     }
                     winit::event::TouchPhase::Moved => {
+                        self.cursor_x = touch.location.x;
                         self.cursor_y = touch.location.y;
                         return true;
                     }
@@ -419,6 +473,8 @@ impl State {
                     log::info!("Loaded MIDI: {} notes, {:.0} BPM, title={}", song.notes.len(), song.bpm, song.title);
                     #[cfg(target_arch = "wasm32")]
                     set_song_title(&song.title);
+                    self.h_offset = Self::auto_center_offset(&song, self.size.width as f32);
+                    self.h_velocity = 0.0;
                     self.triggered_notes = vec![false; song.notes.len()];
                     self.song = song;
                     self.current_time = 0.0;
@@ -460,25 +516,52 @@ impl State {
 
         // Time control priority: drag > momentum > rewind > normal playback
         if self.drag_active {
-            // User is actively dragging — move time based on cursor delta
-            let delta_y = self.cursor_y - self.drag_prev_y;
-            self.current_time += delta_y / scroll_speed;
-            self.current_time = self.current_time.max(0.0);
-            // Track velocity with exponential smoothing for momentum on release
-            if wall_dt > 0.0 {
-                let instant_vel = delta_y / wall_dt;
-                self.scroll_velocity = self.scroll_velocity * 0.7 + instant_vel * 0.3;
-            }
-            self.drag_prev_y = self.cursor_y;
-            // Reset triggers only for notes ahead of current time (so they fire once when reached)
-            if delta_y < 0.0 {
-                let ct = self.current_time as f32;
-                for (i, n) in self.song.notes.iter().enumerate() {
-                    if n.start_time > ct { self.triggered_notes[i] = false; }
+            // Detect dominant axis after threshold movement
+            if self.drag_axis.is_none() {
+                let dx = (self.cursor_x - self.drag_start_x).abs();
+                let dy = (self.cursor_y - self.drag_start_y).abs();
+                let threshold = 8.0;
+                if dx > threshold || dy > threshold {
+                    self.drag_axis = Some(if dx > dy {
+                        DragAxis::Horizontal
+                    } else {
+                        DragAxis::Vertical
+                    });
                 }
             }
+
+            match self.drag_axis {
+                Some(DragAxis::Vertical) | None => {
+                    // Vertical drag: scrub through time (existing behavior)
+                    let delta_y = self.cursor_y - self.drag_prev_y;
+                    self.current_time += delta_y / scroll_speed;
+                    self.current_time = self.current_time.max(0.0);
+                    if wall_dt > 0.0 {
+                        let instant_vel = delta_y / wall_dt;
+                        self.scroll_velocity = self.scroll_velocity * 0.7 + instant_vel * 0.3;
+                    }
+                    if delta_y < 0.0 {
+                        let ct = self.current_time as f32;
+                        for (i, n) in self.song.notes.iter().enumerate() {
+                            if n.start_time > ct { self.triggered_notes[i] = false; }
+                        }
+                    }
+                }
+                Some(DragAxis::Horizontal) => {
+                    // Horizontal drag: scroll keyboard
+                    let delta_x = self.cursor_x - self.drag_prev_x;
+                    self.h_offset += delta_x as f32;
+                    self.h_offset = self.clamp_h_offset(self.h_offset);
+                    if wall_dt > 0.0 {
+                        let instant_vel = delta_x / wall_dt;
+                        self.h_velocity = self.h_velocity * 0.7 + instant_vel * 0.3;
+                    }
+                }
+            }
+            self.drag_prev_x = self.cursor_x;
+            self.drag_prev_y = self.cursor_y;
         } else if self.scroll_velocity.abs() > 1.0 {
-            // Momentum scrolling after drag release (friction deceleration)
+            // Vertical momentum scrolling after drag release
             let friction = 8.0;
             self.scroll_velocity *= (-friction * wall_dt).exp();
             let delta_y = self.scroll_velocity * wall_dt;
@@ -490,9 +573,18 @@ impl State {
                     if n.start_time > ct { self.triggered_notes[i] = false; }
                 }
             }
-            // When momentum dies, resume normal playback if it was playing before drag
             if self.scroll_velocity.abs() <= 1.0 {
                 self.scroll_velocity = 0.0;
+                self.paused = self.was_paused_before_drag;
+            }
+        } else if self.h_velocity.abs() > 1.0 {
+            // Horizontal momentum scrolling after drag release
+            let friction = 8.0;
+            self.h_velocity *= (-friction * wall_dt).exp();
+            self.h_offset += (self.h_velocity * wall_dt) as f32;
+            self.h_offset = self.clamp_h_offset(self.h_offset);
+            if self.h_velocity.abs() <= 1.0 {
+                self.h_velocity = 0.0;
                 self.paused = self.was_paused_before_drag;
             }
         } else if let Some(target) = self.rewind_target {
@@ -526,6 +618,7 @@ impl State {
         let keyboard_y = screen_h - keyboard_height - bottom_margin;
         let scroll_speed_f = scroll_speed as f32;
         let t = self.current_time as f32;
+        let ho = self.h_offset; // horizontal offset for all key positions
 
         let mut note_instances = Vec::new();
         let note_clip_y_grid = keyboard_y - keyboard_height * 0.16;
@@ -534,6 +627,7 @@ impl State {
         // Black keys: half brightness, stay white
         for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
             let (x, w) = keyboard::key_rect(pitch, screen_w);
+            let x = x + ho;
             let semitone = (pitch + 9) % 12; // C=0, C#=1, ..., B=11
             let is_black = keyboard::is_black_key(pitch);
             let color = if is_black {
@@ -600,6 +694,7 @@ impl State {
             }
 
             let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
+            let key_x = key_x + ho;
 
             // Add vertical gap between consecutive notes
             let note_gap = 4.0;
@@ -699,7 +794,7 @@ impl State {
             if !keyboard::is_visible(n.pitch) { continue; }
             if t >= n.start_time && t < n.start_time + n.duration {
                 let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
-                let spawn_x = key_x + key_w / 2.0;
+                let spawn_x = key_x + ho + key_w / 2.0;
                 let spawn_y = keyboard_y;
 
                 let pr = n.pitch as f32 / 87.0;
@@ -732,6 +827,7 @@ impl State {
 
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 let (x, w) = keyboard::key_rect(pitch, screen_w);
+                let x = x + ho;
                 let is_black = keyboard::is_black_key(pitch);
                 let press = self.key_press_state[pitch as usize];
 
@@ -834,6 +930,7 @@ impl State {
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 if !keyboard::is_black_key(pitch) {
                     let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let x = x + ho;
                     let active = active_keys[pitch as usize];
                     let kx = x + gap * 0.5;
                     let kw = w - gap;
@@ -886,6 +983,7 @@ impl State {
             for pitch in keyboard::VISIBLE_START..=keyboard::VISIBLE_END {
                 if keyboard::is_black_key(pitch) {
                     let (x, w) = keyboard::key_rect(pitch, screen_w);
+                    let x = x + ho;
                     let active = active_keys[pitch as usize];
                     let bk_spot = bk_height * 0.18;
 
@@ -949,6 +1047,7 @@ impl State {
         if self.waiting_for_samples { return true; }
         if self.drag_active { return true; }
         if self.scroll_velocity.abs() > 0.5 { return true; }
+        if self.h_velocity.abs() > 0.5 { return true; }
         if self.rewind_target.is_some() { return true; }
         if !self.particle_system.particles.is_empty() { return true; }
         // Keys still transitioning (not yet settled at 0 or 1)
