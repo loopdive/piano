@@ -49,6 +49,7 @@ pub struct QuadRenderer {
     pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
+    globals_bind_group_layout: wgpu::BindGroupLayout,
     index_buffer: wgpu::Buffer,
 }
 
@@ -145,8 +146,17 @@ impl QuadRenderer {
             pipeline,
             globals_buffer,
             globals_bind_group,
+            globals_bind_group_layout,
             index_buffer,
         }
+    }
+
+    pub fn globals_bind_group(&self) -> &wgpu::BindGroup {
+        &self.globals_bind_group
+    }
+
+    pub fn globals_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.globals_bind_group_layout
     }
 
     pub fn update_globals(&self, queue: &wgpu::Queue, width: f32, height: f32) {

@@ -1,3 +1,6 @@
+#[cfg(target_arch = "wasm32")]
+mod audio;
+
 pub mod keyboard;
 pub mod note;
 pub mod renderer;
@@ -24,6 +27,7 @@ struct State<'a> {
     window: &'a Window,
     quad_renderer: renderer::quad::QuadRenderer,
     bloom: renderer::bloom::BloomRenderer,
+    particle_system: renderer::particles::ParticleSystem,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
     #[allow(dead_code)] // used only on wasm32
@@ -32,6 +36,9 @@ struct State<'a> {
     song: note::Song,
     note_instance_buffer: wgpu::Buffer,
     note_instance_count: u32,
+    #[cfg(target_arch = "wasm32")]
+    audio_player: Option<audio::AudioPlayer>,
+    triggered_notes: Vec<bool>,
 }
 
 impl<'a> State<'a> {
@@ -99,6 +106,12 @@ impl<'a> State<'a> {
             surface_format,
         );
 
+        let particle_system = renderer::particles::ParticleSystem::new(
+            &device,
+            quad_renderer.globals_bind_group_layout(),
+            renderer::bloom::BloomRenderer::offscreen_format(),
+        );
+
         let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Keyboard Instances"),
             size: (88 * std::mem::size_of::<QuadInstance>()) as u64,
@@ -109,6 +122,10 @@ impl<'a> State<'a> {
 
         let start_time = 0.0;
         let song = note::demo_song();
+        let triggered_notes = vec![false; song.notes.len()];
+
+        #[cfg(target_arch = "wasm32")]
+        let audio_player = audio::AudioPlayer::new().ok();
         let note_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Note Instances"),
             size: (200 * std::mem::size_of::<QuadInstance>()) as u64,
@@ -118,9 +135,13 @@ impl<'a> State<'a> {
 
         Self {
             surface, device, queue, config, size, window,
-            quad_renderer, bloom, keyboard_instance_buffer, keyboard_instance_count,
+            quad_renderer, bloom, particle_system,
+            keyboard_instance_buffer, keyboard_instance_count,
             start_time, current_time: 0.0, song, note_instance_buffer,
             note_instance_count: 0,
+            #[cfg(target_arch = "wasm32")]
+            audio_player,
+            triggered_notes,
         }
     }
 
@@ -209,6 +230,37 @@ impl<'a> State<'a> {
                 active_keys[n.pitch as usize] = true;
             }
         }
+
+        // Trigger audio for notes hitting the keyboard
+        for (i, n) in self.song.notes.iter().enumerate() {
+            let is_active = t >= n.start_time && t < n.start_time + n.duration;
+            if is_active && !self.triggered_notes[i] {
+                self.triggered_notes[i] = true;
+                #[cfg(target_arch = "wasm32")]
+                if let Some(ref player) = self.audio_player {
+                    let _ = player.play_note(n.pitch, n.velocity);
+                }
+            }
+        }
+
+        // Spawn particles for active notes touching the keyboard
+        let dt = 1.0 / 60.0;
+        for n in &self.song.notes {
+            if t >= n.start_time && t < n.start_time + n.duration {
+                let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
+                let spawn_x = key_x + key_w / 2.0;
+                let spawn_y = keyboard_y;
+
+                let pr = n.pitch as f32 / 87.0;
+                let color = [0.1 + pr * 0.2, 0.3 + pr * 0.5, 0.8 + pr * 0.2];
+
+                // Spawn ~1-2 particles per frame per active note (every 3rd frame)
+                if (t * 60.0) as u32 % 3 == 0 {
+                    self.particle_system.spawn(spawn_x, spawn_y, color, 2);
+                }
+            }
+        }
+        self.particle_system.update(dt);
 
         // Rebuild keyboard instances with highlighting
         let mut kb_instances = Vec::new();
@@ -302,6 +354,12 @@ impl<'a> State<'a> {
                 &mut pass,
                 &self.keyboard_instance_buffer,
                 self.keyboard_instance_count,
+            );
+            // Draw particles with additive blending (after keyboard, still in scene pass)
+            self.particle_system.draw(
+                &mut pass,
+                self.quad_renderer.globals_bind_group(),
+                &self.queue,
             );
         }
 
