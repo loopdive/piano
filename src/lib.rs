@@ -25,6 +25,13 @@ use wasm_bindgen::prelude::*;
 
 // Global pending MIDI data — set by JS, consumed by the render loop
 static PENDING_MIDI: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = window, js_name = _setSongTitle)]
+    fn set_song_title(title: &str);
+}
 /// External code (e.g. load_midi) sets this to wake the render loop
 static REDRAW_FLAG: AtomicBool = AtomicBool::new(false);
 
@@ -191,6 +198,8 @@ impl State {
 
         let start_time = 0.0;
         let song = note::default_song();
+        #[cfg(target_arch = "wasm32")]
+        set_song_title(&song.title);
         let triggered_notes = vec![false; song.notes.len()];
 
         #[cfg(target_arch = "wasm32")]
@@ -407,7 +416,9 @@ impl State {
         if let Some(midi_data) = PENDING_MIDI.lock().unwrap().take() {
             match note::parse_midi(&midi_data) {
                 Ok(song) => {
-                    log::info!("Loaded MIDI: {} notes, {:.0} BPM", song.notes.len(), song.bpm);
+                    log::info!("Loaded MIDI: {} notes, {:.0} BPM, title={}", song.notes.len(), song.bpm, song.title);
+                    #[cfg(target_arch = "wasm32")]
+                    set_song_title(&song.title);
                     self.triggered_notes = vec![false; song.notes.len()];
                     self.song = song;
                     self.current_time = 0.0;

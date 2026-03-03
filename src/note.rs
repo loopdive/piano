@@ -13,6 +13,7 @@ pub struct Note {
 }
 
 pub struct Song {
+    pub title: String,
     pub notes: Vec<Note>,
     pub bpm: f32,
     /// Time (seconds) of each measure boundary
@@ -43,6 +44,7 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
     let mut tempo_map: Vec<(u64, u32)> = Vec::new();
     let mut timesig_map: Vec<(u64, u8, u8)> = Vec::new();
     let mut max_tick: u64 = 0;
+    let mut title = String::new();
     for track in &smf.tracks {
         let mut abs_tick: u64 = 0;
         for event in track {
@@ -53,6 +55,14 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
                 }
                 TrackEventKind::Meta(MetaMessage::TimeSignature(num, den, _, _)) => {
                     timesig_map.push((abs_tick, num, den));
+                }
+                TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
+                    if title.is_empty() {
+                        if let Ok(s) = std::str::from_utf8(name) {
+                            let s = s.trim();
+                            if !s.is_empty() { title = s.to_string(); }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -183,7 +193,7 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
         }
     }
 
-    Ok(Song { notes, bpm, measures, beats })
+    Ok(Song { title, notes, bpm, measures, beats })
 }
 
 /// Helper: push a melody note (MIDI number, start in eighth-note units).
@@ -315,7 +325,7 @@ pub fn demo_song() -> Song {
         t += beat;
         beat_count += 1;
     }
-    Song { notes, bpm, measures, beats }
+    Song { title: "Axel F".to_string(), notes, bpm, measures, beats }
 }
 
 #[cfg(test)]
