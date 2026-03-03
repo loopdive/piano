@@ -24,11 +24,15 @@ impl AudioPlayer {
         Ok(Self)
     }
 
+    /// Unlock/resume the audio context. Must be called from a user gesture handler.
+    pub fn resume(&self) -> Result<(), JsValue> {
+        piano_resume()
+    }
+
     /// Play a note using the JS piano sampler.
     /// pitch: 0-87 key index (added 21 to get MIDI note), velocity: 0.0-1.0, duration in seconds.
     pub fn play_note(&self, pitch: u8, velocity: f32, duration: f32) -> Result<(), JsValue> {
         let midi_note = pitch as u32 + 21; // pitch 0 = A0 = MIDI 21
-        let _ = piano_resume();
         piano_play(midi_note, velocity, duration)
     }
 

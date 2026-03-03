@@ -177,8 +177,7 @@
 
         // Called from Rust via wasm-bindgen extern
         window._pianoPlay = function (midiNote, velocity, duration) {
-          if (!ctx) return;
-          if (ctx.state !== "running") ctx.resume();
+          if (!ctx || ctx.state !== "running") return;
 
           const buf = buffers.get(midiNote);
           if (!buf) {

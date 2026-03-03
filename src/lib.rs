@@ -299,7 +299,7 @@ impl State {
                             self.audio_unlocked = true;
                             #[cfg(target_arch = "wasm32")]
                             if let Some(ref player) = self.audio_player {
-                                let _ = player.play_note(0, 0.0, 0.0);
+                                let _ = player.resume();
                             }
                             // Stay paused until samples are loaded
                             self.waiting_for_samples = true;
@@ -325,7 +325,7 @@ impl State {
                             self.audio_unlocked = true;
                             #[cfg(target_arch = "wasm32")]
                             if let Some(ref player) = self.audio_player {
-                                let _ = player.play_note(0, 0.0, 0.0);
+                                let _ = player.resume();
                             }
                             self.waiting_for_samples = true;
                         }
@@ -381,7 +381,7 @@ impl State {
                             self.audio_unlocked = true;
                             #[cfg(target_arch = "wasm32")]
                             if let Some(ref player) = self.audio_player {
-                                let _ = player.play_note(0, 0.0, 0.0); // triggers piano_resume
+                                let _ = player.resume();
                             }
                             self.waiting_for_samples = true;
                         } else {
@@ -655,19 +655,20 @@ impl State {
             }
         }
 
-        // Trigger audio for notes hitting the keyboard
+        // Trigger audio for notes hitting the keyboard (only when audio is unlocked)
         let is_scrolling = self.drag_active || self.scroll_velocity.abs() > 1.0;
         for (i, n) in self.song.notes.iter().enumerate() {
             let is_active = t >= n.start_time && t < n.start_time + n.duration;
             if is_active && !self.triggered_notes[i] {
                 self.triggered_notes[i] = true;
                 #[cfg(target_arch = "wasm32")]
-                if let Some(ref player) = self.audio_player {
-                    if is_scrolling {
-                        // Half volume, short duration to avoid sustain buildup during scroll
-                        let _ = player.play_note(n.pitch, n.velocity * 0.5, n.duration.min(0.15));
-                    } else {
-                        let _ = player.play_note(n.pitch, n.velocity, n.duration);
+                if self.audio_unlocked {
+                    if let Some(ref player) = self.audio_player {
+                        if is_scrolling {
+                            let _ = player.play_note(n.pitch, n.velocity * 0.5, n.duration.min(0.15));
+                        } else {
+                            let _ = player.play_note(n.pitch, n.velocity, n.duration);
+                        }
                     }
                 }
             }
