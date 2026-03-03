@@ -29,6 +29,7 @@ struct VsOut {
     @location(2) press: f32,
     @location(3) local_uv: vec2<f32>, // position on key surface (0-1 in x and z)
     @location(4) flashlight: f32,     // upcoming note highlight intensity (0-1)
+    @location(5) is_black: f32,
 };
 
 @vertex
@@ -76,6 +77,7 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
     out.press = press;
     out.local_uv = v.position.xz; // unit box x,z → 0..1 across key surface
     out.flashlight = inst.press_black_light.z;
+    out.is_black = inst.press_black_light.y;
     return out;
 }
 
@@ -115,8 +117,14 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
 
     // Pressed key shadow: darken the left edge of the top face for depth
     let is_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
-    let shadow = in.press * is_top * exp(-in.local_uv.x * 6.0) * 0.35;
+    let press_shadow = in.press * is_top * exp(-in.local_uv.x * 6.0) * 0.35;
 
-    let color = in.color.rgb * diffuse * (1.0 - shadow) + vec3<f32>(spec) + spotlight + flashlight;
+    // Black key edge lighting: highlight on left side, shadow on right side
+    let is_left = max(dot(n, vec3<f32>(-1.0, 0.0, 0.0)), 0.0);  // left-facing normal
+    let is_right = max(dot(n, vec3<f32>(1.0, 0.0, 0.0)), 0.0);  // right-facing normal
+    let bk_highlight = in.is_black * is_left * 0.15;
+    let bk_shadow = in.is_black * is_right * 0.4;
+
+    let color = in.color.rgb * diffuse * (1.0 - press_shadow - bk_shadow) + vec3<f32>(spec + bk_highlight) + spotlight + flashlight;
     return vec4<f32>(color, in.color.a);
 }
