@@ -80,6 +80,8 @@ struct State {
     use_3d_keys: bool,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
+    overlay_instance_buffer: wgpu::Buffer,
+    overlay_instance_count: u32,
     key_instances_3d: Vec<KeyInstance3D>,
     #[allow(dead_code)]
     start_time: f64,
@@ -203,6 +205,13 @@ impl State {
         );
         let use_3d_keys = !use_quad_keyboard();
 
+        let overlay_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Overlay Instances"),
+            size: (16 * std::mem::size_of::<QuadInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Keyboard Instances"),
             size: (400 * std::mem::size_of::<QuadInstance>()) as u64,
@@ -231,6 +240,7 @@ impl State {
             quad_renderer, screen_quad_renderer, bloom, particle_system,
             key_renderer, use_3d_keys,
             keyboard_instance_buffer, keyboard_instance_count: 0,
+            overlay_instance_buffer, overlay_instance_count: 0,
             key_instances_3d: Vec::new(),
             start_time, current_time: 0.0, last_wall_time: 0.0, song, note_instance_buffer,
             note_instance_count: 0,
@@ -1055,6 +1065,30 @@ impl State {
             );
             self.keyboard_instance_count = kb_instances.len() as u32;
         }
+
+        // Bottom blende: dark strip drawn AFTER 3D keys to hide pressed key edges
+        {
+            let panel_h = keyboard_height * 0.10;
+            let panel_y = keyboard_y + keyboard_height - panel_h * 0.3;
+            let mut overlay = Vec::new();
+            overlay.push(QuadInstance {
+                pos: [0.0, panel_y],
+                size: [screen_w, panel_h + bottom_margin],
+                color: [0.04, 0.04, 0.05, 1.0],
+            });
+            // Subtle highlight line at top edge of bottom blende
+            overlay.push(QuadInstance {
+                pos: [0.0, panel_y],
+                size: [screen_w, 1.0],
+                color: [0.12, 0.12, 0.14, 1.0],
+            });
+            self.queue.write_buffer(
+                &self.overlay_instance_buffer,
+                0,
+                bytemuck::cast_slice(&overlay),
+            );
+            self.overlay_instance_count = overlay.len() as u32;
+        }
     }
 
     /// Returns true if the scene has ongoing activity requiring another frame.
@@ -1180,6 +1214,31 @@ impl State {
                 &screen_view,
                 &self.key_instances_3d,
                 &self.queue,
+            );
+        }
+
+        // Pass 8: Bottom blende overlay — drawn on top of 3D keys
+        if self.overlay_instance_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Bottom Blende Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &screen_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            self.screen_quad_renderer.draw(
+                &mut pass,
+                &self.overlay_instance_buffer,
+                self.overlay_instance_count,
             );
         }
 
