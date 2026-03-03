@@ -113,6 +113,10 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
     let flash_color = vec3<f32>(1.0, 0.95, 0.15); // vivid yellow
     let flashlight = flash_color * in.flashlight * in.flashlight * flash_top * 5.0;
 
-    let color = in.color.rgb * diffuse + vec3<f32>(spec) + spotlight + flashlight;
+    // Pressed key shadow: darken the left edge of the top face for depth
+    let is_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
+    let shadow = in.press * is_top * exp(-in.local_uv.x * 6.0) * 0.35;
+
+    let color = in.color.rgb * diffuse * (1.0 - shadow) + vec3<f32>(spec) + spotlight + flashlight;
     return vec4<f32>(color, in.color.a);
 }
