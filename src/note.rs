@@ -44,7 +44,7 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
     let mut tempo_map: Vec<(u64, u32)> = Vec::new();
     let mut timesig_map: Vec<(u64, u8, u8)> = Vec::new();
     let mut max_tick: u64 = 0;
-    let mut title = String::new();
+    let mut track_names: Vec<String> = Vec::new();
     for track in &smf.tracks {
         let mut abs_tick: u64 = 0;
         for event in track {
@@ -57,11 +57,9 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
                     timesig_map.push((abs_tick, num, den));
                 }
                 TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
-                    if title.is_empty() {
-                        if let Ok(s) = std::str::from_utf8(name) {
-                            let s = s.trim();
-                            if !s.is_empty() { title = s.to_string(); }
-                        }
+                    if let Ok(s) = std::str::from_utf8(name) {
+                        let s = s.trim();
+                        if !s.is_empty() { track_names.push(s.to_string()); }
                     }
                 }
                 _ => {}
@@ -69,6 +67,15 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
         }
         if abs_tick > max_tick { max_tick = abs_tick; }
     }
+    // Pick title: prefer non-generic instrument names
+    let generic = ["piano", "strings", "bass", "drums", "guitar", "organ",
+                   "synth", "voice", "vocals", "choir", "brass", "woodwind",
+                   "flute", "violin", "cello", "trumpet", "sax", "pad"];
+    let title = track_names.iter()
+        .find(|n| !generic.iter().any(|g| n.eq_ignore_ascii_case(g)))
+        .or(track_names.first())
+        .cloned()
+        .unwrap_or_default();
     tempo_map.sort_by_key(|&(tick, _)| tick);
     if tempo_map.is_empty() || tempo_map[0].0 != 0 {
         tempo_map.insert(0, (0, 500_000)); // default 120 BPM
@@ -219,7 +226,12 @@ fn bass(notes: &mut Vec<Note>, midi: u8, start_8th: f32, dur_8ths: f32, eighth: 
 /// Default demo: embedded MIDI file parsed at startup.
 pub fn default_song() -> Song {
     let midi_data = include_bytes!("../hans-zimmer-cornfield-chase-interstellar-soundtrack-21091-nonstop2k.com.mid");
-    parse_midi(midi_data).unwrap_or_else(|_| demo_song())
+    let mut song = parse_midi(midi_data).unwrap_or_else(|_| demo_song());
+    // The embedded MIDI only has a generic "piano" track name
+    if song.title.is_empty() || song.title.eq_ignore_ascii_case("piano") {
+        song.title = "Cornfield Chase — Hans Zimmer".to_string();
+    }
+    song
 }
 
 /// Axel F (Beverly Hills Cop theme) by Harold Faltermeyer — fallback.
