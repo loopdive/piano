@@ -871,6 +871,10 @@ impl State {
                         color: [0.05, 0.05, 0.07, 1.0],
                     });
                 } else {
+                    // Encode black key neighbors: 1=left, 2=right, 3=both
+                    let has_left = pitch > 0 && keyboard::is_black_key(pitch - 1);
+                    let has_right = pitch < 87 && keyboard::is_black_key(pitch + 1);
+                    let neighbors = has_left as u8 as f32 + has_right as u8 as f32 * 2.0;
                     keys_3d.push(KeyInstance3D {
                         pos_x: x + gap * 0.5,
                         key_width: w - gap,
@@ -879,7 +883,7 @@ impl State {
                         press,
                         is_black: 0.0,
                         light: flash,
-                        _pad_inst: 0.0,
+                        _pad_inst: neighbors,
                         color: [
                             0.92 + p * 0.08,
                             0.90 + p * 0.07,
