@@ -18,7 +18,7 @@ struct VsIn {
 struct Instance {
     @location(2) pos_width: vec2<f32>,        // x position, key width
     @location(3) height_depth: vec2<f32>,     // key height, key depth
-    @location(4) press_black_light: vec4<f32>, // press, is_black, light, _pad
+    @location(4) press_black_light: vec4<f32>, // press, is_black, light, black_neighbors
     @location(5) color: vec4<f32>,
 };
 
@@ -30,6 +30,7 @@ struct VsOut {
     @location(3) local_uv: vec2<f32>, // position on key surface (0-1 in x and z)
     @location(4) flashlight: f32,     // upcoming note highlight intensity (0-1)
     @location(5) is_black: f32,
+    @location(6) black_neighbors: f32, // 1=left, 2=right, 3=both
 };
 
 @vertex
@@ -78,6 +79,7 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
     out.local_uv = v.position.xz; // unit box x,z → 0..1 across key surface
     out.flashlight = inst.press_black_light.z;
     out.is_black = inst.press_black_light.y;
+    out.black_neighbors = inst.press_black_light.w;
     return out;
 }
 
@@ -120,11 +122,21 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
     let press_shadow = in.press * is_top * exp(-in.local_uv.x * 6.0) * 0.35;
 
     // Black key edge lighting: highlight on left side, shadow on right side
-    let is_left = max(dot(n, vec3<f32>(-1.0, 0.0, 0.0)), 0.0);  // left-facing normal
-    let is_right = max(dot(n, vec3<f32>(1.0, 0.0, 0.0)), 0.0);  // right-facing normal
+    let is_left = max(dot(n, vec3<f32>(-1.0, 0.0, 0.0)), 0.0);
+    let is_right = max(dot(n, vec3<f32>(1.0, 0.0, 0.0)), 0.0);
     let bk_highlight = in.is_black * is_left * 0.15;
     let bk_shadow = in.is_black * is_right * 0.4;
 
-    let color = in.color.rgb * diffuse * (1.0 - press_shadow - bk_shadow) + vec3<f32>(spec + bk_highlight) + spotlight + flashlight;
+    // Shadow cast by neighboring black keys onto white key top surface
+    // Only in the front portion of the key where black keys overhang (z < 0.65)
+    let in_black_zone = is_top * (1.0 - in.is_black) * clamp(1.0 - in.local_uv.y / 0.65, 0.0, 1.0);
+    let has_left = step(0.5, in.black_neighbors) * step(in.black_neighbors, 1.5)
+                 + step(2.5, in.black_neighbors); // 1 or 3
+    let has_right = step(1.5, in.black_neighbors); // 2 or 3
+    let left_neighbor_shadow = has_left * exp(-in.local_uv.x * 4.0) * in_black_zone * 0.5;
+    let right_neighbor_shadow = has_right * exp(-(1.0 - in.local_uv.x) * 4.0) * in_black_zone * 0.5;
+
+    let total_shadow = press_shadow + bk_shadow + left_neighbor_shadow + right_neighbor_shadow;
+    let color = in.color.rgb * diffuse * (1.0 - total_shadow) + vec3<f32>(spec + bk_highlight) + spotlight + flashlight;
     return vec4<f32>(color, in.color.a);
 }
