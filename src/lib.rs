@@ -24,7 +24,8 @@ struct State<'a> {
     size: winit::dpi::PhysicalSize<u32>,
     window: &'a Window,
     quad_renderer: renderer::quad::QuadRenderer,
-    test_buffer: wgpu::Buffer,
+    keyboard_instance_buffer: wgpu::Buffer,
+    keyboard_instance_count: u32,
 }
 
 impl<'a> State<'a> {
@@ -81,18 +82,53 @@ impl<'a> State<'a> {
 
         let quad_renderer = renderer::quad::QuadRenderer::new(&device, surface_format);
 
-        let test_instances = [QuadInstance {
-            pos: [100.0, 100.0],
-            size: [200.0, 50.0],
-            color: [0.0, 0.5, 1.0, 1.0],
-        }];
-        let test_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Test"),
-            contents: bytemuck::cast_slice(&test_instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let keyboard_height = size.height as f32 * 0.2;
+        let keyboard_y = size.height as f32 - keyboard_height;
+        let keyboard_width = size.width as f32;
 
-        Self { surface, device, queue, config, size, window, quad_renderer, test_buffer }
+        let mut keyboard_instances = Vec::new();
+
+        // White keys first (drawn underneath)
+        for pitch in 0..88u8 {
+            if !keyboard::is_black_key(pitch) {
+                let (x, w) = keyboard::key_rect(pitch, keyboard_width);
+                keyboard_instances.push(QuadInstance {
+                    pos: [x, keyboard_y],
+                    size: [w - 1.0, keyboard_height],
+                    color: [0.9, 0.9, 0.9, 1.0],
+                });
+            }
+        }
+
+        // Black keys on top
+        for pitch in 0..88u8 {
+            if keyboard::is_black_key(pitch) {
+                let (x, w) = keyboard::key_rect(pitch, keyboard_width);
+                keyboard_instances.push(QuadInstance {
+                    pos: [x, keyboard_y],
+                    size: [w, keyboard_height * 0.65],
+                    color: [0.15, 0.15, 0.15, 1.0],
+                });
+            }
+        }
+
+        let keyboard_instance_count = keyboard_instances.len() as u32;
+        let keyboard_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Keyboard Instances"),
+            size: (88 * std::mem::size_of::<QuadInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &keyboard_instance_buffer,
+            0,
+            bytemuck::cast_slice(&keyboard_instances),
+        );
+
+        Self {
+            surface, device, queue, config, size, window,
+            quad_renderer, keyboard_instance_buffer, keyboard_instance_count,
+        }
     }
 
     fn window(&self) -> &Window { &self.window }
@@ -137,7 +173,7 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            self.quad_renderer.draw(&mut render_pass, &self.test_buffer, 1);
+            self.quad_renderer.draw(&mut render_pass, &self.keyboard_instance_buffer, self.keyboard_instance_count);
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
