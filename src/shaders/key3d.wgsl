@@ -110,8 +110,8 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
     // Soft gradient concentrated at front of key, top face only
     let flash_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
     let flash_z_fade = exp(-in.local_uv.y * 2.0); // brighter at front, fading toward back
-    let flash_color = vec3<f32>(1.0, 0.7, 0.3); // warm orange
-    let flashlight = flash_color * in.flashlight * flash_top * flash_z_fade * 1.5;
+    let flash_color = vec3<f32>(1.0, 0.95, 0.15); // vivid yellow
+    let flashlight = flash_color * in.flashlight * in.flashlight * flash_top * 5.0;
 
     let color = in.color.rgb * diffuse + vec3<f32>(spec) + spotlight + flashlight;
     return vec4<f32>(color, in.color.a);
