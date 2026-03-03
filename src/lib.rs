@@ -1069,7 +1069,7 @@ impl State {
         // Bottom blende: dark strip drawn AFTER 3D keys to hide pressed key edges
         {
             let panel_h = keyboard_height * 0.10;
-            let panel_y = keyboard_y + keyboard_height + panel_h * 0.15;
+            let panel_y = keyboard_y + keyboard_height - panel_h * 0.15;
             let mut overlay = Vec::new();
             overlay.push(QuadInstance {
                 pos: [0.0, panel_y],
