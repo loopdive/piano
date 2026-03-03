@@ -45,7 +45,7 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
 
     // Press: rotate around top edge (z = 0, where notes arrive).
     // The viewer-facing part (z = key_d, bottom of keyboard area) dips down.
-    let angle = press * 0.06; // ~3.4 degrees — bottom edge dips
+    let angle = press * 0.025; // ~1.4 degrees — subtle dip
     let cos_a = cos(angle);
     let sin_a = sin(angle);
     p = vec3<f32>(p.x, p.y * cos_a - p.z * sin_a, p.y * sin_a + p.z * cos_a);
