@@ -18,6 +18,39 @@ use renderer::quad::QuadInstance;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+/// Probe WebGPU by creating a device with the same deprecated limit names
+/// that wgpu 0.19 sends.  If the browser rejects them (newer WebGPU spec),
+/// we know wgpu will fail too, so we fall back to WebGL2 before the canvas
+/// context gets poisoned.
+///
+/// TODO(wgpu>=0.20): wgpu 0.20+ replaced `maxInterStageShaderComponents`
+/// with `maxInterStageShaderVariables`.  Once we upgrade wgpu, simplify
+/// this probe to a plain `navigator.gpu` existence check (or remove it
+/// entirely if wgpu handles the fallback internally).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(inline_js = "
+export async function check_webgpu_support() {
+    if (!navigator.gpu) return false;
+    try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) return false;
+        // wgpu 0.19 requests the deprecated maxInterStageShaderComponents
+        // limit.  If the browser rejects it, wgpu cannot use WebGPU either.
+        const device = await adapter.requestDevice({
+            requiredLimits: { maxInterStageShaderComponents: 60 }
+        });
+        device.destroy();
+        return true;
+    } catch (e) {
+        console.warn('WebGPU probe failed (wgpu 0.19 compat):', e.message);
+        return false;
+    }
+}
+")]
+extern "C" {
+    fn check_webgpu_support() -> js_sys::Promise;
+}
+
 struct State<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -44,11 +77,24 @@ struct State<'a> {
 impl<'a> State<'a> {
     async fn new(window: &'a Window) -> State<'a> {
         let size = window.inner_size();
+        // Probe for real WebGPU support before creating the wgpu instance.
+        // This avoids poisoning the canvas GL context if WebGPU device creation fails.
+        #[cfg(target_arch = "wasm32")]
+        let webgpu_available = wasm_bindgen_futures::JsFuture::from(check_webgpu_support())
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(not(target_arch = "wasm32"))]
             backends: wgpu::Backends::PRIMARY,
             #[cfg(target_arch = "wasm32")]
-            backends: wgpu::Backends::GL,
+            backends: if webgpu_available {
+                wgpu::Backends::BROWSER_WEBGPU
+            } else {
+                wgpu::Backends::GL
+            },
             ..Default::default()
         });
         let surface = instance.create_surface(window).unwrap();
@@ -60,16 +106,19 @@ impl<'a> State<'a> {
             })
             .await
             .unwrap();
+        let backend = adapter.get_info().backend;
+        log::info!("Using backend: {:?}", backend);
+        let required_limits = match backend {
+            wgpu::Backend::BrowserWebGpu => wgpu::Limits::default(),
+            wgpu::Backend::Gl => wgpu::Limits::downlevel_webgl2_defaults(),
+            _ => wgpu::Limits::default(),
+        };
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
                     required_features: wgpu::Features::empty(),
-                    required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
+                    required_limits,
                 },
                 None,
             )
