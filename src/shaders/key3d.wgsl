@@ -28,6 +28,7 @@ struct VsOut {
     @location(1) color: vec4<f32>,
     @location(2) press: f32,
     @location(3) local_uv: vec2<f32>, // position on key surface (0-1 in x and z)
+    @location(4) flashlight: f32,     // upcoming note highlight intensity (0-1)
 };
 
 @vertex
@@ -72,6 +73,7 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
     out.color = inst.color;
     out.press = press;
     out.local_uv = v.position.xz; // unit box x,z → 0..1 across key surface
+    out.flashlight = inst.press_black_light.z;
     return out;
 }
 
@@ -102,6 +104,13 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
     let spot_intensity = in.press * spot_ndotl * falloff;
     let spotlight = in.color.rgb * vec3<f32>(1.0, 0.97, 0.9) * spot_intensity * 2.5;
 
-    let color = in.color.rgb * diffuse + vec3<f32>(spec) + spotlight;
+    // Flashlight: warm glow on keys about to be pressed
+    // Soft gradient concentrated at front of key, top face only
+    let flash_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
+    let flash_z_fade = exp(-in.local_uv.y * 2.0); // brighter at front, fading toward back
+    let flash_color = vec3<f32>(1.0, 0.7, 0.3); // warm orange
+    let flashlight = flash_color * in.flashlight * flash_top * flash_z_fade * 1.5;
+
+    let color = in.color.rgb * diffuse + vec3<f32>(spec) + spotlight + flashlight;
     return vec4<f32>(color, in.color.a);
 }

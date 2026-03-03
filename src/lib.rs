@@ -817,6 +817,21 @@ impl State {
             self.particle_system.particles.clear();
         }
 
+        // Compute flashlight: highlight keys with upcoming notes
+        let lookahead = 0.8_f32; // seconds to look ahead
+        let mut key_flash = [0.0_f32; 88];
+        for n in &self.song.notes {
+            let dt_until = n.start_time - t;
+            if dt_until > 0.0 && dt_until < lookahead {
+                // Intensity: 0 at lookahead distance, 1 at arrival
+                let intensity = 1.0 - dt_until / lookahead;
+                let idx = n.pitch as usize;
+                if idx < 88 {
+                    key_flash[idx] = key_flash[idx].max(intensity);
+                }
+            }
+        }
+
         // Rebuild keyboard instances
         if self.use_3d_keys {
             // 3D key instances
@@ -830,6 +845,7 @@ impl State {
                 let x = x + ho;
                 let is_black = keyboard::is_black_key(pitch);
                 let press = self.key_press_state[pitch as usize];
+                let flash = key_flash[pitch as usize];
 
                 let p = press;
                 if is_black {
@@ -840,7 +856,7 @@ impl State {
                         key_depth: bk_depth_px,
                         press,
                         is_black: 1.0,
-                        light: 0.0,
+                        light: flash,
                         _pad_inst: 0.0,
                         color: [0.05, 0.05, 0.07, 1.0],
                     });
@@ -852,7 +868,7 @@ impl State {
                         key_depth: key_depth_px,
                         press,
                         is_black: 0.0,
-                        light: 0.0,
+                        light: flash,
                         _pad_inst: 0.0,
                         color: [
                             0.82 + p * 0.18,
