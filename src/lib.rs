@@ -487,7 +487,9 @@ impl State {
         let screen_w = self.size.width as f32;
         let screen_h = self.size.height as f32;
         let bottom_margin = screen_h * 0.03;
-        let keyboard_height = screen_h * 0.18;
+        // Derive keyboard height from white key width to maintain aspect ratio
+        let white_key_width = screen_w / 49.0;
+        let keyboard_height = white_key_width * 6.0;
         let keyboard_y = screen_h - keyboard_height - bottom_margin;
         let scroll_speed_f = scroll_speed as f32;
         let t = self.current_time as f32;
@@ -1012,7 +1014,8 @@ impl State {
         if self.use_3d_keys && !self.key_instances_3d.is_empty() {
             let screen_h = self.size.height as f32;
             let bottom_margin = screen_h * 0.03;
-            let keyboard_height = screen_h * 0.18;
+            let white_key_width = self.size.width as f32 / 49.0;
+            let keyboard_height = white_key_width * 6.0;
             let keyboard_y = screen_h - keyboard_height - bottom_margin;
             let max_depth = keyboard_height * 0.95;
             self.key_renderer.update_uniforms(

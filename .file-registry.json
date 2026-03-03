@@ -1,0 +1,6 @@
+{
+  "remotePath": "users/tt/projects/piano",
+  "localPath": "./web",
+  "ignore": ["**/*.map", "**/*.d.ts", "**/.gitignore", "**/package.json"],
+  "permissions": ["public"]
+}
