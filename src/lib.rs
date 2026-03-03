@@ -26,6 +26,11 @@ struct State<'a> {
     quad_renderer: renderer::quad::QuadRenderer,
     keyboard_instance_buffer: wgpu::Buffer,
     keyboard_instance_count: u32,
+    start_time: f64,
+    current_time: f64,
+    song: note::Song,
+    note_instance_buffer: wgpu::Buffer,
+    note_instance_count: u32,
 }
 
 impl<'a> State<'a> {
@@ -125,9 +130,20 @@ impl<'a> State<'a> {
             bytemuck::cast_slice(&keyboard_instances),
         );
 
+        let start_time = 0.0;
+        let song = note::demo_song();
+        let note_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Note Instances"),
+            size: (200 * std::mem::size_of::<QuadInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             surface, device, queue, config, size, window,
             quad_renderer, keyboard_instance_buffer, keyboard_instance_count,
+            start_time, current_time: 0.0, song, note_instance_buffer,
+            note_instance_count: 0,
         }
     }
 
@@ -143,7 +159,70 @@ impl<'a> State<'a> {
     }
 
     fn input(&mut self, _event: &WindowEvent) -> bool { false }
-    fn update(&mut self) {}
+
+    fn update(&mut self) {
+        // Time tracking
+        #[cfg(target_arch = "wasm32")]
+        {
+            let perf = web_sys::window().unwrap().performance().unwrap();
+            self.current_time = perf.now() / 1000.0 - self.start_time;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.current_time += 1.0 / 60.0;
+        }
+
+        let screen_w = self.size.width as f32;
+        let screen_h = self.size.height as f32;
+        let keyboard_height = screen_h * 0.2;
+        let keyboard_y = screen_h - keyboard_height;
+        let scroll_speed = 200.0; // pixels per second
+        let t = self.current_time as f32;
+
+        let mut note_instances = Vec::new();
+
+        for n in &self.song.notes {
+            // Note bottom reaches keyboard_y when t == n.start_time
+            let note_bottom_y = keyboard_y - (n.start_time - t) * scroll_speed;
+            let note_height = n.duration * scroll_speed;
+            let note_top_y = note_bottom_y - note_height;
+
+            // Skip if off screen
+            if note_bottom_y < 0.0 || note_top_y > keyboard_y {
+                continue;
+            }
+
+            let (key_x, key_w) = keyboard::key_rect(n.pitch, screen_w);
+
+            // Clamp to fall area
+            let visible_top = note_top_y.max(0.0);
+            let visible_bottom = note_bottom_y.min(keyboard_y);
+            if visible_bottom <= visible_top {
+                continue;
+            }
+
+            // Color gradient by pitch
+            let pr = n.pitch as f32 / 87.0;
+            let r = 0.1 + pr * 0.2;
+            let g = 0.3 + pr * 0.5;
+            let b = 0.8 + pr * 0.2;
+
+            note_instances.push(QuadInstance {
+                pos: [key_x, visible_top],
+                size: [key_w, visible_bottom - visible_top],
+                color: [r * n.velocity, g * n.velocity, b * n.velocity, 1.0],
+            });
+        }
+
+        if !note_instances.is_empty() {
+            self.queue.write_buffer(
+                &self.note_instance_buffer,
+                0,
+                bytemuck::cast_slice(&note_instances),
+            );
+        }
+        self.note_instance_count = note_instances.len() as u32;
+    }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
@@ -173,6 +252,11 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+            // Draw notes first (behind keyboard)
+            if self.note_instance_count > 0 {
+                self.quad_renderer.draw(&mut render_pass, &self.note_instance_buffer, self.note_instance_count);
+            }
+            // Draw keyboard on top
             self.quad_renderer.draw(&mut render_pass, &self.keyboard_instance_buffer, self.keyboard_instance_count);
         }
         self.queue.submit(iter::once(encoder.finish()));
