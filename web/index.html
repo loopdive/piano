@@ -176,8 +176,12 @@
         }
 
         // Called from Rust via wasm-bindgen extern
+        let playCount = 0;
         window._pianoPlay = function (midiNote, velocity, duration) {
-          if (!ctx || ctx.state !== "running") return;
+          if (!ctx || ctx.state !== "running") {
+            if (playCount++ < 3) dbg("play blocked: ctx=" + (ctx ? ctx.state : "null"));
+            return;
+          }
 
           const buf = buffers.get(midiNote);
           if (!buf) {
@@ -212,45 +216,68 @@
           }
         };
 
+        // Debug overlay for iOS testing
+        function dbg(msg) {
+          console.log("[audio] " + msg);
+          if (statusEl) statusEl.textContent = msg;
+        }
+
         // iOS Safari requires AudioContext creation + resume inside a user gesture.
         // Play a silent buffer to fully unlock audio on iOS.
-        function unlockAudio() {
-          if (!ctx) {
-            const AC = window.AudioContext || window.webkitAudioContext;
-            ctx = new AC();
-            preload();
-          }
-          if (ctx.state === "suspended") {
-            ctx.resume();
-            // iOS needs a silent buffer play to fully unlock
-            const silent = ctx.createBuffer(1, 1, 22050);
-            const src = ctx.createBufferSource();
-            src.buffer = silent;
-            src.connect(ctx.destination);
-            src.start();
+        function unlockAudio(source) {
+          dbg("unlock from: " + source);
+          try {
+            if (!ctx) {
+              const AC = window.AudioContext || window.webkitAudioContext;
+              if (!AC) { dbg("NO AudioContext!"); return; }
+              ctx = new AC();
+              dbg("ctx created, state=" + ctx.state + ", sampleRate=" + ctx.sampleRate);
+              preload();
+            }
+            if (ctx.state !== "running") {
+              // "interrupted" (iOS PWA) can't be resumed — need a fresh context
+              if (ctx.state === "interrupted") {
+                dbg("interrupted — recreating context");
+                ctx.close().catch(() => {});
+                const AC = window.AudioContext || window.webkitAudioContext;
+                ctx = new AC();
+                dbg("new ctx state=" + ctx.state);
+                preload();
+              }
+              const p = ctx.resume();
+              if (p && p.then) p.then(() => dbg("resumed → " + ctx.state));
+              const silent = ctx.createBuffer(1, 1, 22050);
+              const src = ctx.createBufferSource();
+              src.buffer = silent;
+              src.connect(ctx.destination);
+              src.start();
+              dbg("silent buf played, state=" + ctx.state);
+            } else {
+              dbg("already running");
+            }
+          } catch (e) {
+            dbg("ERROR: " + e.message);
           }
         }
 
-        window._pianoResume = unlockAudio;
+        // Called from WASM — must NOT create AudioContext (iOS won't count it as gesture)
+        window._pianoResume = function () {
+          if (ctx && ctx.state !== "running") {
+            dbg("wasm resume attempt, state=" + ctx.state);
+            ctx.resume();
+          }
+        };
 
         // iOS Safari: AudioContext must be created+resumed in a user gesture.
         // Use capturing phase on both document and canvas to catch events before
         // winit's preventDefault() consumes them.
-        let audioInited = false;
-        function init() {
-          if (audioInited) return;
-          audioInited = true;
-          unlockAudio();
+        // Keep trying on every gesture until audio is running
+        function init(e) {
+          if (ctx && ctx.state === "running") return;
+          unlockAudio(e.type + " on " + e.target.tagName);
         }
         for (const evt of ["click", "touchstart", "touchend", "mousedown"]) {
           document.addEventListener(evt, init, { capture: true, passive: true });
-        }
-        // Also try on canvas directly once it exists
-        const canvas = document.getElementById("canvas");
-        if (canvas) {
-          for (const evt of ["touchstart", "touchend", "mousedown"]) {
-            canvas.addEventListener(evt, init, { capture: true, passive: true });
-          }
         }
       })();
     </script>

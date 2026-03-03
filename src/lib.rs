@@ -487,12 +487,20 @@ impl State {
         } else if let Some(target) = self.rewind_target {
             let rewind_speed = 8.0;
             let step = wall_dt * rewind_speed * (self.current_time.max(1.0));
+            let prev_time = self.current_time as f32;
             self.current_time -= step;
             if self.current_time <= target {
                 self.current_time = target;
                 self.rewind_target = None;
-                self.triggered_notes.fill(false);
                 self.particle_system.particles.clear();
+            }
+            // Reset triggers for notes whose start_time we just rewound past
+            // so they fire again when reached during forward playback or rewind
+            let ct = self.current_time as f32;
+            for (i, n) in self.song.notes.iter().enumerate() {
+                if n.start_time >= ct && n.start_time < prev_time {
+                    self.triggered_notes[i] = false;
+                }
             }
         } else if !self.paused {
             self.current_time += wall_dt;
