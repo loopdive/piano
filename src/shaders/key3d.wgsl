@@ -43,7 +43,7 @@ fn vs_key(v: VsIn, inst: Instance) -> VsOut {
     var n = v.normal;
 
     // Press: rotate around back edge (z = key_d) — real piano key pivot
-    let angle = press * 0.06; // ~3.4 degrees at full press
+    let angle = press * -0.06; // ~3.4 degrees downward at full press
     let cos_a = cos(angle);
     let sin_a = sin(angle);
     let dz = p.z - key_d;

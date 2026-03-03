@@ -233,14 +233,25 @@
 
         window._pianoResume = unlockAudio;
 
-        // Start loading on first user interaction (click + touchstart for iOS)
+        // iOS Safari: AudioContext must be created+resumed in a user gesture.
+        // Use capturing phase on both document and canvas to catch events before
+        // winit's preventDefault() consumes them.
+        let audioInited = false;
         function init() {
+          if (audioInited) return;
+          audioInited = true;
           unlockAudio();
-          document.removeEventListener("click", init);
-          document.removeEventListener("touchstart", init);
         }
-        document.addEventListener("click", init, { once: false });
-        document.addEventListener("touchstart", init, { once: false });
+        for (const evt of ["click", "touchstart", "touchend", "mousedown"]) {
+          document.addEventListener(evt, init, { capture: true, passive: true });
+        }
+        // Also try on canvas directly once it exists
+        const canvas = document.getElementById("canvas");
+        if (canvas) {
+          for (const evt of ["touchstart", "touchend", "mousedown"]) {
+            canvas.addEventListener(evt, init, { capture: true, passive: true });
+          }
+        }
       })();
     </script>
 
