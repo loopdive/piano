@@ -128,7 +128,7 @@ impl<'a> State<'a> {
         let audio_player = audio::AudioPlayer::new().ok();
         let note_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Note Instances"),
-            size: (200 * std::mem::size_of::<QuadInstance>()) as u64,
+            size: (500 * std::mem::size_of::<QuadInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -147,7 +147,16 @@ impl<'a> State<'a> {
 
     fn window(&self) -> &Window { &self.window }
 
+    #[allow(unused_variables)]
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        // On WASM, use the canvas buffer dimensions (which we control)
+        // rather than the reported physical size (which includes DPR scaling).
+        #[cfg(target_arch = "wasm32")]
+        let new_size = {
+            use winit::platform::web::WindowExtWebSys;
+            let canvas = self.window.canvas().unwrap();
+            winit::dpi::PhysicalSize::new(canvas.width(), canvas.height())
+        };
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
             self.config.width = new_size.width;
@@ -155,7 +164,6 @@ impl<'a> State<'a> {
             self.surface.configure(&self.device, &self.config);
             self.bloom
                 .resize(&self.device, new_size.width, new_size.height);
-            // Update globals uniform so shaders know the new screen dimensions
             self.quad_renderer.update_globals(
                 &self.queue,
                 new_size.width as f32,
@@ -207,16 +215,16 @@ impl<'a> State<'a> {
                 continue;
             }
 
-            // Color gradient by pitch
+            // Color gradient by pitch: deep blue (low) → cyan (mid) → light blue (high)
             let pr = n.pitch as f32 / 87.0;
-            let r = 0.1 + pr * 0.2;
-            let g = 0.3 + pr * 0.5;
-            let b = 0.8 + pr * 0.2;
+            let r = (0.15 + pr * 0.35) * n.velocity;
+            let g = (0.3 + pr * 0.5) * n.velocity;
+            let b = (0.8 + pr * 0.2) * n.velocity;
 
             note_instances.push(QuadInstance {
                 pos: [key_x, visible_top],
                 size: [key_w, visible_bottom - visible_top],
-                color: [r * n.velocity, g * n.velocity, b * n.velocity, 1.0],
+                color: [r, g, b, 1.0],
             });
         }
 
@@ -258,12 +266,10 @@ impl<'a> State<'a> {
                 let spawn_y = keyboard_y;
 
                 let pr = n.pitch as f32 / 87.0;
-                let color = [0.1 + pr * 0.2, 0.3 + pr * 0.5, 0.8 + pr * 0.2];
+                let color = [0.2 + pr * 0.3, 0.4 + pr * 0.4, 0.9 + pr * 0.1];
 
-                // Spawn ~1-2 particles per frame per active note (every 3rd frame)
-                if (t * 60.0) as u32 % 3 == 0 {
-                    self.particle_system.spawn(spawn_x, spawn_y, color, 2);
-                }
+                // Spawn 1-2 particles per frame per active note
+                self.particle_system.spawn(spawn_x, spawn_y, color, 2);
             }
         }
         self.particle_system.update(dt);
@@ -298,9 +304,9 @@ impl<'a> State<'a> {
             if !keyboard::is_black_key(pitch) {
                 let (x, w) = keyboard::key_rect(pitch, screen_w);
                 let color = if active_keys[pitch as usize] {
-                    [0.3, 0.6, 1.0, 1.0]
+                    [0.5, 0.7, 1.0, 1.0]
                 } else {
-                    [0.9, 0.9, 0.9, 1.0]
+                    [0.22, 0.22, 0.25, 1.0]
                 };
                 kb_instances.push(QuadInstance {
                     pos: [x, keyboard_y],
@@ -315,9 +321,9 @@ impl<'a> State<'a> {
             if keyboard::is_black_key(pitch) {
                 let (x, w) = keyboard::key_rect(pitch, screen_w);
                 let color = if active_keys[pitch as usize] {
-                    [0.2, 0.4, 0.9, 1.0]
+                    [0.3, 0.5, 0.9, 1.0]
                 } else {
-                    [0.15, 0.15, 0.15, 1.0]
+                    [0.06, 0.06, 0.08, 1.0]
                 };
                 kb_instances.push(QuadInstance {
                     pos: [x, keyboard_y],
@@ -393,11 +399,13 @@ impl<'a> State<'a> {
 
         // Pass 2: Bright extract
         self.bloom.extract_pass(&mut encoder);
-        // Pass 3: Horizontal blur
+        // Pass 3-4: First blur iteration (wide glow)
         self.bloom.blur_h_pass(&mut encoder);
-        // Pass 4: Vertical blur
         self.bloom.blur_v_pass(&mut encoder);
-        // Pass 5: Composite -> swapchain
+        // Pass 5-6: Second blur iteration (wider, softer glow)
+        self.bloom.blur_h_pass(&mut encoder);
+        self.bloom.blur_v_pass(&mut encoder);
+        // Pass 7: Composite -> swapchain
         self.bloom.composite_pass(&mut encoder, &screen_view);
 
         self.queue.submit(iter::once(encoder.finish()));
@@ -425,18 +433,22 @@ pub async fn run() {
 
     #[cfg(target_arch = "wasm32")]
     {
-        use winit::dpi::PhysicalSize;
         use winit::platform::web::WindowExtWebSys;
+        let canvas_el = window.canvas().unwrap();
+        // Set canvas buffer to match CSS container size (ignore DPR for consistent rendering)
+        canvas_el.set_width(1200);
+        canvas_el.set_height(800);
+        canvas_el.style().set_property("width", "100%").unwrap();
+        canvas_el.style().set_property("height", "100%").unwrap();
         web_sys::window()
             .and_then(|win| win.document())
             .and_then(|doc| {
                 let dst = doc.get_element_by_id("piano-fall")?;
-                let canvas = web_sys::Element::from(window.canvas()?);
+                let canvas = web_sys::Element::from(canvas_el);
                 dst.append_child(&canvas).ok()?;
                 Some(())
             })
             .expect("Couldn't append canvas to document body.");
-        let _ = window.request_inner_size(PhysicalSize::new(1200, 800));
     }
 
     let mut state = State::new(&window).await;

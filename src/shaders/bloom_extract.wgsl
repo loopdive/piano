@@ -21,8 +21,8 @@ fn luminance(c: vec3<f32>) -> f32 {
 fn fs_extract(in: FullscreenOutput) -> @location(0) vec4<f32> {
     let color = textureSample(t_scene, s_scene, in.uv).rgb;
     let lum = luminance(color);
-    let threshold = 0.4;
-    let knee = 0.2;
+    let threshold = 0.25;
+    let knee = 0.15;
     let softness = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
     let contribution = softness * softness / (4.0 * knee + 0.0001);
     let brightness = max(lum - threshold, contribution);

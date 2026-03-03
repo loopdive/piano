@@ -164,12 +164,13 @@ impl BloomRenderer {
         );
 
         // ---- Blur uniform buffers ----
+        let blur_spread = 4.0; // wider blur for visible glow
         let blur_h_uniforms = BlurUniforms {
-            direction: [1.0 / width as f32, 0.0],
+            direction: [blur_spread / width as f32, 0.0],
             _padding: [0.0; 2],
         };
         let blur_v_uniforms = BlurUniforms {
-            direction: [0.0, 1.0 / height as f32],
+            direction: [0.0, blur_spread / height as f32],
             _padding: [0.0; 2],
         };
         let blur_h_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -387,12 +388,13 @@ impl BloomRenderer {
         // The buffers have COPY_DST usage so they will be written in the next frame
         // via queue.write_buffer from the caller. We store the new values here
         // by recreating the uniform bind groups (buffers themselves are reused).
+        let blur_spread = 4.0;
         let blur_h_uniforms = BlurUniforms {
-            direction: [1.0 / width as f32, 0.0],
+            direction: [blur_spread / width as f32, 0.0],
             _padding: [0.0; 2],
         };
         let blur_v_uniforms = BlurUniforms {
-            direction: [0.0, 1.0 / height as f32],
+            direction: [0.0, blur_spread / height as f32],
             _padding: [0.0; 2],
         };
 
@@ -443,8 +445,8 @@ fn create_offscreen_texture(
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width,
-            height,
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,

@@ -21,16 +21,30 @@ struct BlurUniforms {
 
 @fragment
 fn fs_blur(in: FullscreenOutput) -> @location(0) vec4<f32> {
-    // 9-tap Gaussian (sigma ~ 4.0)
-    let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    // 9-tap Gaussian blur, manually unrolled (WebGL2 requires constant array indexing)
+    let w0 = 0.227027;
+    let w1 = 0.1945946;
+    let w2 = 0.1216216;
+    let w3 = 0.054054;
+    let w4 = 0.016216;
 
-    var color = textureSample(t_input, s_input, in.uv).rgb * weights[0];
+    var color = textureSample(t_input, s_input, in.uv).rgb * w0;
 
-    for (var i = 1; i < 5; i++) {
-        let offset = blur.direction * f32(i);
-        color += textureSample(t_input, s_input, in.uv + offset).rgb * weights[i];
-        color += textureSample(t_input, s_input, in.uv - offset).rgb * weights[i];
-    }
+    let o1 = blur.direction * 1.0;
+    color += textureSample(t_input, s_input, in.uv + o1).rgb * w1;
+    color += textureSample(t_input, s_input, in.uv - o1).rgb * w1;
+
+    let o2 = blur.direction * 2.0;
+    color += textureSample(t_input, s_input, in.uv + o2).rgb * w2;
+    color += textureSample(t_input, s_input, in.uv - o2).rgb * w2;
+
+    let o3 = blur.direction * 3.0;
+    color += textureSample(t_input, s_input, in.uv + o3).rgb * w3;
+    color += textureSample(t_input, s_input, in.uv - o3).rgb * w3;
+
+    let o4 = blur.direction * 4.0;
+    color += textureSample(t_input, s_input, in.uv + o4).rgb * w4;
+    color += textureSample(t_input, s_input, in.uv - o4).rgb * w4;
 
     return vec4<f32>(color, 1.0);
 }
