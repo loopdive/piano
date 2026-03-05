@@ -98,6 +98,8 @@ static PENDING_MIDI: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = _setSongTitle)]
     fn set_song_title(title: &str);
+    #[wasm_bindgen(js_namespace = window, js_name = _setPaused)]
+    fn set_paused(paused: bool);
 }
 /// External code (e.g. load_midi) sets this to wake the render loop
 static REDRAW_FLAG: AtomicBool = AtomicBool::new(false);
@@ -159,6 +161,7 @@ struct State {
     key_press_state: [f32; 88],
     surface_configured: bool,
     paused: bool,
+    prev_paused: bool,
     audio_unlocked: bool,
     waiting_for_samples: bool,
     rewind_target: Option<f64>,
@@ -336,6 +339,7 @@ impl State {
             key_press_state: [0.0; 88],
             surface_configured: false,
             paused: true,
+            prev_paused: true,
             audio_unlocked: false,
             waiting_for_samples: false,
             rewind_target: None,
@@ -399,13 +403,20 @@ impl State {
         let (zx_max, zw_max) = keyboard::key_rect(max_pitch, zoomed_w);
         let note_center = (zx_min + zx_max + zw_max) / 2.0;
         let h_offset = screen_w / 2.0 - note_center;
+        // Clamp so the keyboard edges don't go past the screen
+        let min_offset = screen_w - zoomed_w;
+        let h_offset = h_offset.clamp(min_offset, 0.0);
         (zoom, h_offset)
     }
 
     fn clamp_h_offset(&self, offset: f32) -> f32 {
         let screen_w = self.size.width as f32;
-        let max_offset = screen_w * (self.keyboard_zoom - 1.0) * 0.5 + screen_w * 0.3;
-        offset.clamp(-max_offset, max_offset)
+        let zoomed_width = screen_w * self.keyboard_zoom;
+        // Don't let the keyboard scroll past either edge of the screen
+        // Left edge of keyboard (0 + offset) must be <= 0  →  offset <= 0
+        // Right edge (zoomed_width + offset) must be >= screen_w  →  offset >= screen_w - zoomed_width
+        let min_offset = screen_w - zoomed_width; // negative when zoomed in
+        offset.clamp(min_offset, 0.0)
     }
 
     #[allow(unused_variables)]
@@ -484,7 +495,11 @@ impl State {
                         return true;
                     }
                     ElementState::Released => {
+                        let was_tap = self.drag_axis.is_none();
                         self.drag_active = false;
+                        if was_tap && self.audio_unlocked {
+                            self.paused = !self.paused;
+                        }
                         return true;
                     }
                 }
@@ -993,10 +1008,10 @@ impl State {
         if self.theme == NoteTheme::Ice {
             let glow_base = keyboard_y - keyboard_height * 0.16;
             let glow_layers: &[(f32, f32, [f32; 4])] = &[
-                (0.0,  2.0,  [0.20, 0.50, 1.0, 0.9]),  // bright core line
-                (2.0,  8.0,  [0.12, 0.35, 0.85, 0.4]),  // near glow
-                (10.0, 18.0, [0.08, 0.25, 0.65, 0.15]), // mid haze
-                (28.0, 30.0, [0.04, 0.15, 0.45, 0.06]), // outer fade
+                (0.0,  2.0,  [0.20, 0.50, 1.0, 0.7]),  // bright core line
+                (2.0,  5.0,  [0.12, 0.35, 0.85, 0.25]), // near glow
+                (7.0, 10.0,  [0.08, 0.25, 0.65, 0.08]), // mid haze
+                (17.0, 12.0, [0.04, 0.15, 0.45, 0.03]), // outer fade
             ];
             for &(offset, h, color) in glow_layers {
                 note_instances.push(QuadInstance {
@@ -1143,7 +1158,7 @@ impl State {
                         is_black: 1.0,
                         light: flash,
                         _pad_inst: 0.0,
-                        color: [0.05, 0.05, 0.07, 1.0],
+                        color: [0.03, 0.03, 0.05, 1.0],
                     });
                 } else {
                     // Encode black key neighbors: 1=left, 2=right, 3=both
@@ -1160,9 +1175,9 @@ impl State {
                         light: flash,
                         _pad_inst: neighbors,
                         color: [
-                            0.92 + p * 0.08,
-                            0.90 + p * 0.07,
-                            0.87 + p * 0.05,
+                            0.82 + p * 0.08,
+                            0.80 + p * 0.07,
+                            0.77 + p * 0.05,
                             1.0,
                         ],
                     });
@@ -1190,12 +1205,12 @@ impl State {
             // Neon glow at the top edge of the front panel (Ice theme only)
             let glow_top = keyboard_y - front_panel_h;
             if self.theme == NoteTheme::Ice {
-                let glow_total_h = 144.0_f32;
-                let glow_steps = 24_u32;
+                let glow_total_h = 80.0_f32;
+                let glow_steps = 16_u32;
                 let step_h = glow_total_h / glow_steps as f32;
                 for s in 0..glow_steps {
                     let frac = s as f32 / (glow_steps - 1) as f32;
-                    let alpha = 0.02 + frac * frac * 0.35;
+                    let alpha = 0.01 + frac * frac * 0.2;
                     let r = 0.15 + frac * 0.8;
                     let g = 0.4 + frac * 0.55;
                     let y = glow_top - glow_total_h + s as f32 * step_h;
@@ -1370,6 +1385,13 @@ impl State {
                 bytemuck::cast_slice(&overlay),
             );
             self.overlay_instance_count = overlay.len() as u32;
+        }
+
+        // Notify JS of pause state changes
+        #[cfg(target_arch = "wasm32")]
+        if self.paused != self.prev_paused {
+            set_paused(self.paused);
+            self.prev_paused = self.paused;
         }
     }
 

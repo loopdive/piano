@@ -2,7 +2,7 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta name="mobile-web-app-capable" content="yes" />
     <title>Piano Fall</title>
     <style>
@@ -10,6 +10,7 @@
         margin: 0;
         background: #000;
         overflow: hidden;
+        touch-action: none;
       }
       #piano-fall {
         width: 100vw;
@@ -59,16 +60,28 @@
       #midi-input {
         display: none;
       }
-      #loading-status {
+      #play-overlay {
         position: fixed;
-        bottom: 10px;
+        top: 40%;
         left: 50%;
-        transform: translateX(-50%);
-        z-index: 20;
-        color: #4af;
-        font-family: sans-serif;
-        font-size: 14px;
-        text-align: center;
+        transform: translate(-50%, -50%);
+        z-index: 30;
+        width: 100px;
+        height: 100px;
+        cursor: pointer;
+        transition: opacity 0.3s ease;
+        background: radial-gradient(circle closest-side, rgba(0,0,0,0.65) 0%, rgba(0,0,0,0.5) 78%, transparent 92%);
+        border-radius: 50%;
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+      }
+      #play-overlay.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #play-overlay svg {
+        width: 100%;
+        height: 100%;
       }
       #key-labels {
         position: fixed;
@@ -97,7 +110,21 @@
     <div id="song-title"></div>
     <button id="midi-upload">Load</button>
     <input type="file" id="midi-input" accept=".mid,.midi" />
-    <div id="loading-status"></div>
+    <div id="play-overlay">
+      <svg viewBox="0 0 100 100">
+        <!-- Background track (dim ring) -->
+        <circle cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="3" />
+        <!-- Progress arc — drawn via stroke-dasharray -->
+        <circle id="progress-ring" cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.6)"
+          stroke-width="3" stroke-linecap="round"
+          stroke-dasharray="0 289.03" transform="rotate(-90 50 50)" />
+        <!-- Percentage text (shown during loading) -->
+        <text id="progress-text" x="52" y="50" text-anchor="middle" dominant-baseline="central" fill="rgba(255,255,255,0.8)"
+          font-family="sans-serif" font-size="18"><tspan font-weight="bold">0</tspan><tspan font-weight="300">%</tspan></text>
+        <!-- Play triangle (hidden during loading) -->
+        <polygon id="play-icon" points="40,30 40,70 72,50" fill="rgba(255,255,255,0.6)" stroke="rgba(255,255,255,0.8)" stroke-width="1" stroke-linejoin="round" style="display:none" />
+      </svg>
+    </div>
 
     <script>
       // Piano Sampler — loads real piano samples from FluidR3 GM soundfont (MIT license)
@@ -123,7 +150,70 @@
         let fetchedCount = 0;
         let decodedCount = 0;
         let samplesReady = false;
-        const statusEl = document.getElementById("loading-status");
+        const overlay = document.getElementById("play-overlay");
+        const progressRing = document.getElementById("progress-ring");
+        const playIcon = document.getElementById("play-icon");
+        const progressText = document.getElementById("progress-text");
+        const CIRCUMFERENCE = 2 * Math.PI * 46; // ~289.03
+
+        let displayedProgress = 0;
+        let targetProgress = 0;
+        let animating = false;
+
+        function renderProgress() {
+          displayedProgress += (targetProgress - displayedProgress) * 0.15;
+          if (Math.abs(targetProgress - displayedProgress) < 0.002) displayedProgress = targetProgress;
+          const filled = displayedProgress * CIRCUMFERENCE;
+          progressRing.setAttribute("stroke-dasharray", filled + " " + CIRCUMFERENCE);
+          progressText.innerHTML = '<tspan font-weight="bold">' + Math.round(displayedProgress * 100) + '</tspan><tspan font-weight="300">%</tspan>';
+          if (displayedProgress < targetProgress) {
+            requestAnimationFrame(renderProgress);
+          } else {
+            animating = false;
+          }
+        }
+
+        function updateProgress(fraction) {
+          targetProgress = fraction;
+          if (!animating) {
+            animating = true;
+            requestAnimationFrame(renderProgress);
+          }
+        }
+
+        // Combined progress: WASM download + sample fetches
+        let wasmFraction = 0;
+        let sampleFraction = 0;
+        let samplesFetched = false;
+        let wasmLoaded = false;
+        const WASM_WEIGHT = 0.3;
+        const SAMPLE_WEIGHT = 0.7;
+
+        function updateCombinedProgress() {
+          updateProgress(WASM_WEIGHT * wasmFraction + SAMPLE_WEIGHT * sampleFraction);
+        }
+
+        function checkAllReady() {
+          if (samplesFetched && wasmLoaded) showPlayButton();
+        }
+
+        window._updateWasmProgress = function (frac) {
+          wasmFraction = frac;
+          updateCombinedProgress();
+        };
+
+        window._notifyWasmLoaded = function () {
+          wasmLoaded = true;
+          wasmFraction = 1;
+          updateCombinedProgress();
+          checkAllReady();
+        };
+
+        function showPlayButton() {
+          playIcon.style.display = "";
+          progressText.style.display = "none";
+          progressRing.setAttribute("stroke-dasharray", CIRCUMFERENCE + " " + CIRCUMFERENCE);
+        }
 
         window._areSamplesReady = function () {
           return samplesReady;
@@ -143,8 +233,8 @@
             const arrayBuf = await resp.arrayBuffer();
             rawBuffers.set(midi, arrayBuf);
             fetchedCount++;
-            if (statusEl)
-              statusEl.textContent = "Fetching samples: " + fetchedCount + "/88";
+            sampleFraction = fetchedCount / 88;
+            updateCombinedProgress();
           } catch (e) {
             console.warn("Failed to fetch sample for MIDI " + midi, e);
           }
@@ -153,7 +243,6 @@
         // Phase 2: decode raw buffers once AudioContext is available
         async function decodeAll() {
           if (!ctx) return;
-          if (statusEl) statusEl.textContent = "Decoding samples...";
           const promises = [];
           for (const [midi, raw] of rawBuffers) {
             if (buffers.has(midi)) continue;
@@ -167,20 +256,23 @@
           await Promise.all(promises);
           if (decodedCount >= rawBuffers.size) {
             samplesReady = true;
-            if (statusEl) statusEl.textContent = "";
+            showPlayButton();
             console.log("All piano samples loaded");
           }
         }
 
         // Start fetching immediately (no AudioContext required)
         (function prefetch() {
-          if (statusEl) statusEl.textContent = "Fetching samples...";
           const promises = [];
           for (let i = 21; i <= 108; i++) {
             promises.push(fetchNote(i));
           }
           Promise.all(promises).then(() => {
-            console.log("All samples fetched, awaiting AudioContext for decode");
+            console.log("All samples fetched");
+            samplesFetched = true;
+            sampleFraction = 1;
+            updateCombinedProgress();
+            checkAllReady();
             if (ctx) decodeAll();
           });
         })();
@@ -261,7 +353,6 @@
         // Debug overlay for iOS testing
         function dbg(msg) {
           console.log("[audio] " + msg);
-          if (statusEl) statusEl.textContent = msg;
         }
 
         // iOS Safari requires AudioContext creation + resume inside a user gesture.
@@ -328,6 +419,36 @@
         const el = document.getElementById("song-title");
         if (el) el.textContent = title || "";
       };
+
+      // Play/pause overlay — called from Rust via wasm-bindgen
+      window._setPaused = function (paused) {
+        const el = document.getElementById("play-overlay");
+        if (!el) return;
+        const upload = document.getElementById("midi-upload");
+        if (paused) {
+          el.classList.remove("hidden");
+          if (upload) upload.style.display = "";
+        } else {
+          el.classList.add("hidden");
+          if (upload) upload.style.display = "none";
+        }
+      };
+
+      // Forward play overlay clicks to the canvas as a Space keypress (toggles play/pause)
+      document.getElementById("play-overlay").addEventListener("click", function (e) {
+        e.stopPropagation();
+        const canvas = document.getElementById("canvas");
+        canvas.dispatchEvent(new KeyboardEvent("keydown", { code: "Space", key: " ", bubbles: true }));
+        canvas.dispatchEvent(new KeyboardEvent("keyup", { code: "Space", key: " ", bubbles: true }));
+      });
+
+      // Prevent browser zoom (Ctrl+scroll, Ctrl+plus/minus, pinch)
+      document.addEventListener("wheel", function (e) {
+        if (e.ctrlKey || e.metaKey) e.preventDefault();
+      }, { passive: false });
+      document.addEventListener("keydown", function (e) {
+        if ((e.ctrlKey || e.metaKey) && (e.key === "+" || e.key === "-" || e.key === "=" || e.key === "0")) e.preventDefault();
+      });
     </script>
 
     <script>
@@ -389,7 +510,32 @@
 
       import init, { load_midi } from "./pkg/piano_fall.js";
       window._loadMidi = load_midi;
-      await init();
+
+      // Fetch WASM with download progress tracking
+      const wasmResp = await fetch("./pkg/piano_fall_bg.wasm");
+      const contentLength = wasmResp.headers.get("Content-Length");
+      let wasmBytes;
+      if (contentLength && wasmResp.body) {
+        const total = parseInt(contentLength);
+        const reader = wasmResp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          if (total > 0) window._updateWasmProgress(received / total);
+        }
+        wasmBytes = new Uint8Array(received);
+        let pos = 0;
+        for (const c of chunks) { wasmBytes.set(c, pos); pos += c.length; }
+      } else {
+        wasmBytes = new Uint8Array(await wasmResp.arrayBuffer());
+        window._updateWasmProgress(1);
+      }
+      window._notifyWasmLoaded();
+      await init(wasmBytes);
     </script>
   </body>
 </html>

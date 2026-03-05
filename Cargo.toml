@@ -39,3 +39,14 @@ web-sys = { version = "0.3", features = [
     "Request", "RequestInit", "RequestMode", "Response",
     "Headers",
 ] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+
+# Disable wasm-pack's bundled wasm-opt (v126 can't handle bulk-memory ops from opt-level="z" + LTO).
+# Rust's own LLVM backend handles the optimization.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

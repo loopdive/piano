@@ -108,14 +108,12 @@ fn fs_key(in: VsOut) -> @location(0) vec4<f32> {
     let dist_sq = dx * dx * 4.0 + dz * dz * 1.5; // elliptical: tighter in x, longer in z
     let falloff = exp(-dist_sq * 3.0);
     let spot_intensity = in.press * spot_ndotl * falloff;
-    let spotlight = in.color.rgb * vec3<f32>(1.0, 0.97, 0.9) * spot_intensity * 2.5;
+    // Additive white glow on pressed keys — subdued on black keys
+    let glow_strength = select(0.12, 0.35, in.is_black < 0.5);
+    let press_glow = vec3<f32>(1.0, 1.0, 1.0) * in.press * spot_ndotl * glow_strength;
+    let spotlight = in.color.rgb * vec3<f32>(1.0, 0.97, 0.9) * spot_intensity * 3.5 + press_glow;
 
-    // Flashlight: warm glow on keys about to be pressed
-    // Soft gradient concentrated at front of key, top face only
-    let flash_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
-    let flash_z_fade = exp(-in.local_uv.y * 2.0); // brighter at front, fading toward back
-    let flash_color = vec3<f32>(1.0, 0.95, 0.15); // vivid yellow
-    let flashlight = flash_color * in.flashlight * in.flashlight * flash_top * 5.0 * (1.0 - in.is_black);
+    let flashlight = vec3<f32>(0.0);
 
     // Pressed key shadow: darken the left edge of the top face for depth
     let is_top = max(dot(n, vec3<f32>(0.0, 1.0, 0.0)), 0.0);
