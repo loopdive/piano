@@ -37,13 +37,13 @@ fn default_theme() -> NoteTheme {
     {
         if let Some(win) = web_sys::window() {
             if let Ok(search) = win.location().search() {
-                if search.contains("theme=ice") {
-                    return NoteTheme::Ice;
+                if search.contains("theme=rainbow") {
+                    return NoteTheme::Rainbow;
                 }
             }
         }
     }
-    NoteTheme::Rainbow
+    NoteTheme::Ice
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {

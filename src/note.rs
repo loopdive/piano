@@ -70,7 +70,7 @@ pub fn parse_midi(data: &[u8]) -> Result<Song, &'static str> {
     // Pick title: prefer non-generic instrument names
     let generic = ["piano", "strings", "bass", "drums", "guitar", "organ",
                    "synth", "voice", "vocals", "choir", "brass", "woodwind",
-                   "flute", "violin", "cello", "trumpet", "sax", "pad"];
+                   "flute", "violin", "cello", "trumpet", "sax", "pad", "untitled"];
     let title = track_names.iter()
         .find(|n| !generic.iter().any(|g| n.eq_ignore_ascii_case(g)))
         .or(track_names.first())
@@ -225,11 +225,10 @@ fn bass(notes: &mut Vec<Note>, midi: u8, start_8th: f32, dur_8ths: f32, eighth: 
 
 /// Default demo: embedded MIDI file parsed at startup.
 pub fn default_song() -> Song {
-    let midi_data = include_bytes!("../hans-zimmer-cornfield-chase-interstellar-soundtrack-21091-nonstop2k.com.mid");
+    let midi_data = include_bytes!("../web/moonlight.mid");
     let mut song = parse_midi(midi_data).unwrap_or_else(|_| demo_song());
-    // The embedded MIDI only has a generic "piano" track name
     if song.title.is_empty() || song.title.eq_ignore_ascii_case("piano") {
-        song.title = "Cornfield Chase — Hans Zimmer".to_string();
+        song.title = "Moonlight Sonata — Beethoven".to_string();
     }
     song
 }

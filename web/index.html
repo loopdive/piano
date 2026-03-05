@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <title>Piano Fall</title>
     <style>
       body {
@@ -118,8 +118,10 @@
         ];
         const CDN = "samples"; // local samples directory
         let ctx = null;
-        const buffers = new Map();
-        let loadedCount = 0;
+        const buffers = new Map();       // midi → AudioBuffer (decoded)
+        const rawBuffers = new Map();    // midi → ArrayBuffer (fetched, not yet decoded)
+        let fetchedCount = 0;
+        let decodedCount = 0;
         let samplesReady = false;
         const statusEl = document.getElementById("loading-status");
 
@@ -133,33 +135,59 @@
           return note + octave;
         }
 
-        async function loadNote(midi) {
+        // Phase 1: fetch raw mp3 data (no AudioContext needed)
+        async function fetchNote(midi) {
           try {
             const name = midiToName(midi);
             const resp = await fetch(CDN + "/" + name + ".mp3");
             const arrayBuf = await resp.arrayBuffer();
-            const audioBuf = await ctx.decodeAudioData(arrayBuf);
-            buffers.set(midi, audioBuf);
-            loadedCount++;
+            rawBuffers.set(midi, arrayBuf);
+            fetchedCount++;
             if (statusEl)
-              statusEl.textContent = "Piano samples: " + loadedCount + "/88";
+              statusEl.textContent = "Fetching samples: " + fetchedCount + "/88";
           } catch (e) {
-            console.warn("Failed to load sample for MIDI " + midi, e);
+            console.warn("Failed to fetch sample for MIDI " + midi, e);
           }
         }
 
-        function preload() {
-          if (statusEl) statusEl.textContent = "Loading piano samples...";
-          // Load all 88 piano keys in parallel (MIDI 21=A0 to 108=C8)
+        // Phase 2: decode raw buffers once AudioContext is available
+        async function decodeAll() {
+          if (!ctx) return;
+          if (statusEl) statusEl.textContent = "Decoding samples...";
           const promises = [];
-          for (let i = 21; i <= 108; i++) {
-            promises.push(loadNote(i));
+          for (const [midi, raw] of rawBuffers) {
+            if (buffers.has(midi)) continue;
+            promises.push(
+              ctx.decodeAudioData(raw.slice(0)).then(audioBuf => {
+                buffers.set(midi, audioBuf);
+                decodedCount++;
+              }).catch(e => console.warn("Failed to decode MIDI " + midi, e))
+            );
           }
-          Promise.all(promises).then(() => {
+          await Promise.all(promises);
+          if (decodedCount >= rawBuffers.size) {
             samplesReady = true;
             if (statusEl) statusEl.textContent = "";
             console.log("All piano samples loaded");
+          }
+        }
+
+        // Start fetching immediately (no AudioContext required)
+        (function prefetch() {
+          if (statusEl) statusEl.textContent = "Fetching samples...";
+          const promises = [];
+          for (let i = 21; i <= 108; i++) {
+            promises.push(fetchNote(i));
+          }
+          Promise.all(promises).then(() => {
+            console.log("All samples fetched, awaiting AudioContext for decode");
+            if (ctx) decodeAll();
           });
+        })();
+
+        function preload() {
+          // Called when AudioContext becomes available — decode fetched buffers
+          decodeAll();
         }
 
         // Synth fallback for when samples aren't loaded yet
