@@ -585,7 +585,11 @@ impl State {
                             }
                         }
                         if self.touches.is_empty() {
+                            let was_tap = self.drag_axis.is_none();
                             self.drag_active = false;
+                            if was_tap && self.audio_unlocked {
+                                self.paused = !self.paused;
+                            }
                         }
                         return true;
                     }
